@@ -7,18 +7,99 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <freertos/semphr.h>
 #include <cstring>
 #include "assets/lang_config.h"
 
 #define TAG "WS"
 
-WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
+WebsocketProtocol::WebsocketProtocol() {
+    event_group_handle_ = xEventGroupCreate();
+    esp_timer_create_args_t timer_args = {
+        .callback =
+            [](void* arg) {
+                auto* protocol = static_cast<WebsocketProtocol*>(arg);
+                auto alive = protocol->alive_;
+                if (!*alive || protocol->reconnect_pending_.exchange(true)) {
+                    return;
+                }
+                Application::GetInstance().Schedule([protocol, alive]() {
+                    if (!*alive) {
+                        return;
+                    }
+                    protocol->reconnect_pending_ = false;
+                    protocol->CheckConnection();
+                });
+            },
+        .arg = this,
+        .name = "ws_reconnect",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &reconnect_timer_));
+}
 
-WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+WebsocketProtocol::~WebsocketProtocol() {
+    {
+        std::lock_guard<std::recursive_mutex> lock(*callback_mutex_);
+        *alive_ = false;
+    }
+    esp_timer_stop(reconnect_timer_);
+    esp_timer_delete(reconnect_timer_);
+    // Timer deletion is deferred and does not join an already running callback.
+    // A task-dispatched fence keeps `this` alive until earlier timer callbacks finish.
+    auto fence_done = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(fence_done ? ESP_OK : ESP_ERR_NO_MEM);
+    esp_timer_handle_t fence_timer;
+    esp_timer_create_args_t fence_args = {
+        .callback = [](void* arg) { xSemaphoreGive(static_cast<SemaphoreHandle_t>(arg)); },
+        .arg = fence_done,
+        .name = "ws_deinit",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&fence_args, &fence_timer));
+    ESP_ERROR_CHECK(esp_timer_start_once(fence_timer, 1));
+    xSemaphoreTake(fence_done, portMAX_DELAY);
+    esp_timer_delete(fence_timer);
+    vSemaphoreDelete(fence_done);
+    ResetTransport();
+    vEventGroupDelete(event_group_handle_);
+}
 
 bool WebsocketProtocol::Start() {
-    // Only connect to server when audio channel is needed
-    return true;
+    if (!esp_timer_is_active(reconnect_timer_)) {
+        ESP_ERROR_CHECK(esp_timer_start_periodic(reconnect_timer_, 5000000));
+    }
+    return Connect(false);
+}
+
+void WebsocketProtocol::CheckConnection() {
+    if (IsAudioChannelOpened()) {
+        return;
+    }
+    ResetTransport();
+    if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+        ESP_LOGI(TAG, "Restoring standby websocket connection");
+        Connect(false);
+    }
+}
+
+void WebsocketProtocol::ResetTransport() {
+    bool was_ready;
+    {
+        std::lock_guard<std::recursive_mutex> lock(*callback_mutex_);
+        was_ready = ready_.exchange(false);
+        if (channel_alive_) {
+            *channel_alive_ = false;
+        }
+    }
+    // Never destroy TCP while holding the callback lock: Disconnect may join its RX task.
+    websocket_.reset();
+    if (was_ready && *alive_ && on_audio_channel_closed_) {
+        on_audio_channel_closed_();
+    }
+}
+
+bool WebsocketProtocol::IsTimeout() const {
+    const auto now = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+    return now - last_received_seconds_.load() > 120;
 }
 
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
@@ -68,15 +149,28 @@ bool WebsocketProtocol::SendText(const std::string& text) {
 }
 
 bool WebsocketProtocol::IsAudioChannelOpened() const {
-    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
+    return ready_.load() && !error_occurred_ && !IsTimeout();
 }
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
-    (void)send_goodbye;  // Websocket doesn't need to send goodbye message
-    websocket_.reset();
+    if (send_goodbye && IsAudioChannelOpened()) {
+        // stop finalizes ASR; closing a conversation must cancel it instead.
+        SendAbortSpeaking(kAbortReasonNone);
+    }
+    // The gateway needs this transport to deliver alarms while the device is idle.
+    if (on_audio_channel_closed_) {
+        on_audio_channel_closed_();
+    }
 }
 
-bool WebsocketProtocol::OpenAudioChannel() {
+bool WebsocketProtocol::OpenAudioChannel() { return Connect(true); }
+
+bool WebsocketProtocol::Connect(bool report_error) {
+    if (IsAudioChannelOpened()) {
+        return true;
+    }
+    ResetTransport();
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -86,6 +180,13 @@ bool WebsocketProtocol::OpenAudioChannel() {
     }
 
     error_occurred_ = false;
+    if (url.empty()) {
+        ESP_LOGW(TAG, "Websocket endpoint is not configured");
+        if (report_error) {
+            SetError(Lang::Strings::SERVER_NOT_FOUND);
+        }
+        return false;
+    }
 
     auto network = Board::GetInstance().GetNetwork();
     websocket_ = network->CreateWebSocket(1);
@@ -105,31 +206,53 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
 
-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
+    channel_alive_ = std::make_shared<std::atomic<bool>>(true);
+    auto channel_alive = channel_alive_;
+    auto alive = alive_;
+    auto callback_mutex = callback_mutex_;
+    websocket_->OnData([this, alive, channel_alive, callback_mutex](const char* data, size_t len,
+                                                                    bool binary) {
+        std::lock_guard<std::recursive_mutex> lock(*callback_mutex);
+        if (!*alive || !*channel_alive) {
+            return;
+        }
+        last_received_seconds_ = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
-                    BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
-                    bp2->version = ntohs(bp2->version);
-                    bp2->type = ntohs(bp2->type);
-                    bp2->timestamp = ntohl(bp2->timestamp);
-                    bp2->payload_size = ntohl(bp2->payload_size);
-                    auto payload = (uint8_t*)bp2->payload;
+                    if (len < sizeof(BinaryProtocol2)) {
+                        ESP_LOGW(TAG, "Short v2 audio frame");
+                        return;
+                    }
+                    const auto* bp2 = reinterpret_cast<const BinaryProtocol2*>(data);
+                    const auto payload_size = ntohl(bp2->payload_size);
+                    if (payload_size > len - sizeof(BinaryProtocol2)) {
+                        ESP_LOGW(TAG, "Invalid v2 audio payload size");
+                        return;
+                    }
+                    auto payload = bp2->payload;
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
-                        .timestamp = bp2->timestamp,
-                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)}));
+                        .timestamp = ntohl(bp2->timestamp),
+                        .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
                 } else if (version_ == 3) {
-                    BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
-                    bp3->type = bp3->type;
-                    bp3->payload_size = ntohs(bp3->payload_size);
-                    auto payload = (uint8_t*)bp3->payload;
+                    if (len < sizeof(BinaryProtocol3)) {
+                        ESP_LOGW(TAG, "Short v3 audio frame");
+                        return;
+                    }
+                    const auto* bp3 = reinterpret_cast<const BinaryProtocol3*>(data);
+                    const auto payload_size = ntohs(bp3->payload_size);
+                    if (payload_size > len - sizeof(BinaryProtocol3)) {
+                        ESP_LOGW(TAG, "Invalid v3 audio payload size");
+                        return;
+                    }
+                    auto payload = bp3->payload;
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
                         .timestamp = 0,
-                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)}));
+                        .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
                 } else {
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
@@ -155,10 +278,14 @@ bool WebsocketProtocol::OpenAudioChannel() {
             }
             cJSON_Delete(root);
         }
-        last_incoming_time_ = std::chrono::steady_clock::now();
     });
 
-    websocket_->OnDisconnected([this]() {
+    websocket_->OnDisconnected([this, alive, channel_alive, callback_mutex]() {
+        std::lock_guard<std::recursive_mutex> lock(*callback_mutex);
+        if (!*alive || !*channel_alive) {
+            return;
+        }
+        ready_ = false;
         ESP_LOGI(TAG, "Websocket disconnected");
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
@@ -168,13 +295,20 @@ bool WebsocketProtocol::OpenAudioChannel() {
     ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
     if (!websocket_->Connect(url.c_str())) {
         ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
-        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        ResetTransport();
+        if (report_error) {
+            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        }
         return false;
     }
 
     // Send hello message to describe the client
     auto message = GetHelloMessage();
-    if (!SendText(message)) {
+    if (!websocket_->Send(message)) {
+        ResetTransport();
+        if (report_error) {
+            SetError(Lang::Strings::SERVER_ERROR);
+        }
         return false;
     }
 
@@ -182,12 +316,27 @@ bool WebsocketProtocol::OpenAudioChannel() {
     EventBits_t bits =
         xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT, pdTRUE,
                             pdFALSE, pdMS_TO_TICKS(10000));
-    if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT)) {
+    bool connected;
+    {
+        std::lock_guard<std::recursive_mutex> lock(*callback_mutex_);
+        connected = (bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT) && websocket_->IsConnected();
+        if (connected) {
+            ready_ = true;
+        }
+    }
+    if (!connected) {
         ESP_LOGE(TAG, "Failed to receive server hello");
-        SetError(Lang::Strings::SERVER_TIMEOUT);
+        ResetTransport();
+        if (report_error) {
+            SetError(Lang::Strings::SERVER_TIMEOUT);
+        }
         return false;
     }
 
+    ESP_LOGI(TAG, "Standby websocket ready");
+    if (on_connected_) {
+        on_connected_();
+    }
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();
     }
@@ -223,8 +372,8 @@ std::string WebsocketProtocol::GetHelloMessage() {
 
 void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "websocket") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+    if (!cJSON_IsString(transport) || strcmp(transport->valuestring, "websocket") != 0) {
+        ESP_LOGE(TAG, "Unsupported websocket transport");
         return;
     }
 
