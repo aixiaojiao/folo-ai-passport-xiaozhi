@@ -213,6 +213,10 @@ void Application::Run() {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
             }
+            if (pending_passive_tts_finish_ && GetDeviceState() == kDeviceStateSpeaking &&
+                audio_service_.IsPlaybackIdle()) {
+                FinishPassiveTts();
+            }
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
             if (pending_listening_start_ && GetDeviceState() == kDeviceStateListening &&
@@ -236,6 +240,9 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                if (passive_tts_) {
+                    continue;
+                }
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     // Drop the remaining packets. Leaving them in the queue would
                     // stall the Opus codec task (it waits for queue space), which in
@@ -348,6 +355,10 @@ void Application::HandleActivationDoneEvent() {
     Schedule([this]() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        // Connect only after activation has put the main state machine into Idle.
+        if (protocol_) {
+            protocol_->Start();
+        }
     });
 }
 
@@ -518,6 +529,7 @@ void Application::CheckNewVersion() {
 }
 
 void Application::InitializeProtocol() {
+    ++protocol_generation_;
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto codec = board.GetAudioCodec();
@@ -533,21 +545,34 @@ void Application::InitializeProtocol() {
         protocol_ = std::make_unique<MqttProtocol>();
     }
 
-    protocol_->OnConnected([this]() { DismissAlert(); });
+    protocol_->OnConnected([this]() { ScheduleProtocol([this]() { DismissAlert(); }); });
 
     protocol_->OnNetworkError([this](const std::string& message) {
-        last_error_message_ = message;
-        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+        ScheduleProtocol([this, message]() {
+            last_error_message_ = message;
+            xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+        });
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
-        }
+        // std::function needs a copyable capture; moving the payload avoids copying Opus data.
+        auto shared_packet = std::shared_ptr<AudioStreamPacket>(std::move(packet));
+        ScheduleProtocol([this, packet = std::move(shared_packet)]() {
+            if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
+                if (audio_service_.PushPacketToDecodeQueue(
+                        std::make_unique<AudioStreamPacket>(std::move(*packet)))) {
+                    ++tts_packet_count_;
+                } else {
+                    ++tts_dropped_packets_;
+                    ESP_LOGW(TAG, "TTS decode queue full, dropping packet");
+                }
+            }
+        });
     });
 
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        board.SetPowerSaveLevel(GetDeviceState() == kDeviceStateIdle ? PowerSaveLevel::LOW_POWER
+                                                                     : PowerSaveLevel::PERFORMANCE);
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG,
                      "Server sample rate %d does not match device output sample rate %d, "
@@ -556,9 +581,13 @@ void Application::InitializeProtocol() {
         }
     });
 
-    protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        Schedule([this]() {
+    protocol_->OnAudioChannelClosed([this]() {
+        ++protocol_generation_;
+        ScheduleProtocol([this]() {
+            passive_tts_ = false;
+            pending_passive_tts_finish_ = false;
+            audio_service_.ResetDecoder();
+            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -601,24 +630,57 @@ void Application::InitializeProtocol() {
                 }
             }
 
-            Schedule([this, url = std::string(audio_url->valuestring),
-                      subtitles = std::move(subtitles)]() mutable {
+            ScheduleProtocol([this, url = std::string(audio_url->valuestring),
+                              subtitles = std::move(subtitles)]() mutable {
                 StartNotification(std::move(url), std::move(subtitles));
             });
+        } else if (strcmp(type->valuestring, "ping") == 0) {
+            // WebsocketProtocol has already refreshed transport liveness.
         } else if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (!cJSON_IsString(state)) {
                 return;
             }
             if (strcmp(state->valuestring, "start") == 0) {
-                Schedule([this]() {
+                ScheduleProtocol([this]() {
+                    auto state = GetDeviceState();
+                    if (state != kDeviceStateIdle && state != kDeviceStateListening &&
+                        state != kDeviceStateSpeaking) {
+                        ESP_LOGW(TAG, "Ignoring TTS start outside an audio-ready state");
+                        return;
+                    }
+                    passive_tts_ = state == kDeviceStateIdle ||
+                                   (state == kDeviceStateSpeaking && passive_tts_);
+                    pending_passive_tts_finish_ = false;
+                    tts_packet_count_ = 0;
+                    tts_dropped_packets_ = 0;
                     aborted_ = false;
+                    // Prepare before the first scheduled binary frame; the state-change
+                    // event must not reset the decoder again after frames are queued.
+                    audio_service_.ResetDecoder();
+                    if (passive_tts_ || listening_mode_ != kListeningModeRealtime) {
+                        audio_service_.EnableVoiceProcessing(false);
+                        audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                    }
+                    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
                     SetDeviceState(kDeviceStateSpeaking);
+                    ESP_LOGI(TAG, "TTS start (%s)",
+                             passive_tts_ ? "passive alarm" : "conversation");
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
+                ScheduleProtocol([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        if (passive_tts_) {
+                            ESP_LOGI(
+                                TAG,
+                                "Passive TTS stop: queued=%lu dropped=%lu, waiting for playback",
+                                static_cast<unsigned long>(tts_packet_count_),
+                                static_cast<unsigned long>(tts_dropped_packets_));
+                            pending_passive_tts_finish_ = true;
+                            if (audio_service_.IsPlaybackIdle()) {
+                                FinishPassiveTts();
+                            }
+                        } else if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -634,8 +696,8 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
-                              glyphs = std::move(glyphs), bpp]() {
+                    ScheduleProtocol([display, message = std::string(text->valuestring),
+                                      glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
                     });
@@ -650,8 +712,8 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
-                          glyphs = std::move(glyphs), bpp]() {
+                ScheduleProtocol([display, message = std::string(text->valuestring),
+                                  glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -659,7 +721,7 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
-                Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
+                ScheduleProtocol([display, emotion_str = std::string(emotion->valuestring)]() {
                     display->SetEmotion(emotion_str.c_str());
                 });
             }
@@ -674,7 +736,7 @@ void Application::InitializeProtocol() {
                 ESP_LOGI(TAG, "System command: %s", command->valuestring);
                 if (strcmp(command->valuestring, "reboot") == 0) {
                     // Do a reboot if user requests a OTA update
-                    Schedule([this]() { Reboot(); });
+                    ScheduleProtocol([this]() { Reboot(); });
                 } else {
                     ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
                 }
@@ -706,8 +768,6 @@ void Application::InitializeProtocol() {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
     });
-
-    protocol_->Start();
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -982,6 +1042,10 @@ void Application::HandleStateChangedEvent() {
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
+    if (new_state != kDeviceStateSpeaking) {
+        passive_tts_ = false;
+        pending_passive_tts_finish_ = false;
+    }
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -996,6 +1060,7 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1024,12 +1089,11 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
-            if (listening_mode_ != kListeningModeRealtime) {
+            if (passive_tts_ || listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1053,6 +1117,7 @@ void Application::StartListeningAudio() {
         return;
     }
 
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     // Send the start listening command
     protocol_->SendStartListening(listening_mode_);
     audio_service_.EnableVoiceProcessing(true);
@@ -1150,15 +1215,40 @@ void Application::Schedule(std::function<void()>&& callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
+void Application::ScheduleProtocol(std::function<void()>&& callback) {
+    const auto generation = protocol_generation_.load();
+    Schedule([this, generation, callback = std::move(callback)]() {
+        if (generation == protocol_generation_.load()) {
+            callback();
+        }
+    });
+}
+
+void Application::FinishPassiveTts() {
+    pending_passive_tts_finish_ = false;
+    passive_tts_ = false;
+    ESP_LOGI(TAG, "Passive TTS playback drained: queued=%lu dropped=%lu; returning to idle",
+             static_cast<unsigned long>(tts_packet_count_),
+             static_cast<unsigned long>(tts_dropped_packets_));
+    SetDeviceState(kDeviceStateIdle);
+}
+
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    if (passive_tts_) {
+        pending_passive_tts_finish_ = false;
+        audio_service_.ResetDecoder();
+        SetDeviceState(kDeviceStateIdle);
+    }
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
+    passive_tts_ = false;
+    pending_passive_tts_finish_ = false;
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
 }
@@ -1346,7 +1436,12 @@ void Application::ResetProtocol() {
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();
         }
-        // Reset protocol
+        // Invalidate work queued by the retired transport, including its close callback.
         protocol_.reset();
+        ++protocol_generation_;
+        passive_tts_ = false;
+        pending_passive_tts_finish_ = false;
+        audio_service_.ResetDecoder();
+        SetDeviceState(kDeviceStateIdle);
     });
 }
