@@ -71,8 +71,6 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
-    ESP_LOGI(TAG, "After board/audio init");
-    SystemInfo::PrintHeapStats();
 
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
@@ -337,31 +335,20 @@ void Application::HandleActivationDoneEvent() {
 
     has_server_time_ = ota_->HasServerTime();
 
-    // Protocol start may have already raised MAIN_EVENT_ERROR. Do not replace
-    // that alert with the "ready" UI/sound — the main loop can process both
-    // events back-to-back because the activation task is lower priority.
-    const bool has_error = !last_error_message_.empty();
-    if (!has_error) {
-        auto display = Board::GetInstance().GetDisplay();
-        display->ClearActivationCode();
-        display->SetStatus(Lang::Strings::STANDBY);
-        display->SetEmotion("neutral");
-        std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
-        display->ShowNotification(message.c_str());
-        display->SetChatMessage("system", "");
-    }
+    auto display = Board::GetInstance().GetDisplay();
+    std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
+    display->ShowNotification(message.c_str());
+    display->SetChatMessage("system", "");
 
     // Release OTA object after activation is complete
     ota_.reset();
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 
-    if (!has_error) {
-        Schedule([this]() {
-            // Play the success sound to indicate the device is ready
-            audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
-        });
-    }
+    Schedule([this]() {
+        // Play the success sound to indicate the device is ready
+        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+    });
 }
 
 void Application::ActivationTask() {
@@ -451,21 +438,21 @@ void Application::CheckNewVersion() {
         auto display = board.GetDisplay();
         display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
 
-        auto check = ota_->CheckVersion();
-        if (!check) {
+        esp_err_t err = ota_->CheckVersion();
+        if (err != ESP_OK) {
             retry_count++;
             if (retry_count >= MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
                 return;
             }
 
-            const auto& err = check.error();
-            char error_message[160];
+            char error_message[128];
             int error_message_length =
-                snprintf(error_message, sizeof(error_message), "%s", err.ToString().c_str());
+                snprintf(error_message, sizeof(error_message), "code=%d, url=%s", err,
+                         ota_->GetCheckVersionUrl().c_str());
             if (error_message_length < 0 ||
                 error_message_length >= static_cast<int>(sizeof(error_message))) {
-                snprintf(error_message, sizeof(error_message), "%s", err.Message());
+                snprintf(error_message, sizeof(error_message), "code=%d", err);
             }
 
             char buffer[320];
@@ -474,7 +461,7 @@ void Application::CheckNewVersion() {
                          retry_delay, error_message);
             if (alert_message_length < 0 ||
                 alert_message_length >= static_cast<int>(sizeof(buffer))) {
-                snprintf(buffer, sizeof(buffer), "%s", err.Message());
+                snprintf(buffer, sizeof(buffer), "code=%d", err);
             }
             Alert(Lang::Strings::ERROR, buffer, "cloud_off", Lang::Sounds::OGG_EXCLAMATION);
 
@@ -513,12 +500,10 @@ void Application::CheckNewVersion() {
         }
 
         // This will block the loop until the activation is done or timeout
-        bool activation_succeeded = false;
         for (int i = 0; i < 10; ++i) {
             ESP_LOGI(TAG, "Activating... %d/%d", i + 1, 10);
             esp_err_t err = ota_->Activate();
             if (err == ESP_OK) {
-                activation_succeeded = true;
                 break;
             } else if (err == ESP_ERR_TIMEOUT) {
                 vTaskDelay(pdMS_TO_TICKS(3000));
@@ -528,9 +513,6 @@ void Application::CheckNewVersion() {
             if (GetDeviceState() == kDeviceStateIdle) {
                 break;
             }
-        }
-        if (activation_succeeded) {
-            break;
         }
     }
 }
@@ -743,8 +725,6 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
     // This sentence uses 9KB of SRAM, so we need to wait for it to finish
     Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
 
-    Board::GetInstance().GetDisplay()->ShowActivationCode(code.c_str(), message.c_str());
-
     for (const auto& digit : code) {
         auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
                                [digit](const digit_sound& ds) { return ds.digit == digit; });
@@ -767,7 +747,6 @@ void Application::Alert(const char* status, const char* message, const char* emo
 }
 
 void Application::DismissAlert() {
-    last_error_message_.clear();
     if (GetDeviceState() == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
@@ -1012,15 +991,9 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
-            // Keep a just-raised network error visible. SetDeviceState(idle)
-            // queues STATE_CHANGED after Alert(), and the idle handler would
-            // otherwise wipe the status, emotion, and chat message.
-            if (last_error_message_.empty()) {
-                display->SetStatus(Lang::Strings::STANDBY);
-                display->ClearChatMessages();  // Clear messages first
-                display->SetEmotion(
-                    "neutral");  // Then set emotion (wechat mode checks child count)
-            }
+            display->SetStatus(Lang::Strings::STANDBY);
+            display->ClearChatMessages();    // Clear messages first
+            display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;

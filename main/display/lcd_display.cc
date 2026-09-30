@@ -3,12 +3,8 @@
 #include "gif/lvgl_gif.h"
 #include "lvgl_theme.h"
 #include "settings.h"
-#if CONFIG_BOARD_TYPE_FOLOTOY_AI_PASSPORT
-#include "lvgl_screen_rounding.h"
-#endif
 
 #include <esp_err.h>
-#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
@@ -17,76 +13,11 @@
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
 #include <cstring>
-#include <string>
 #include <vector>
-
-#include "../../managed_components/espressif2022__esp_emote_gfx/src/lib/qrcode/qrcodegen.h"
 
 #include "board.h"
 
 #define TAG "LcdDisplay"
-
-namespace {
-
-constexpr char kActivationQrUrl[] = "https://xiaozhi.me";
-
-void HideActivationObjects(lv_obj_t* qrcode, lv_obj_t* hint, lv_obj_t* site, lv_obj_t* code) {
-    if (qrcode != nullptr) {
-        lv_obj_add_flag(qrcode, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (hint != nullptr) {
-        lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (site != nullptr) {
-        lv_obj_add_flag(site, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (code != nullptr) {
-        lv_obj_add_flag(code, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-#if CONFIG_BOARD_TYPE_FOLOTOY_AI_PASSPORT
-void RoundedFlushEvent(lv_event_t* event) {
-    lv_display_t* display =
-        static_cast<lv_display_t*>(lv_event_get_target(event));
-    const lv_area_t* area = static_cast<const lv_area_t*>(lv_event_get_param(event));
-    lv_draw_buf_t* draw_buf = lv_display_get_buf_active(display);
-    if (area == nullptr || draw_buf == nullptr || draw_buf->data == nullptr ||
-        lv_display_get_color_format(display) != LV_COLOR_FORMAT_RGB565) {
-        return;
-    }
-
-    const int32_t width = lv_area_get_width(area);
-    const int32_t screen_width = lv_display_get_horizontal_resolution(display);
-    const int32_t screen_height = lv_display_get_vertical_resolution(display);
-    if (draw_buf->header.stride < static_cast<uint32_t>(width) * sizeof(uint16_t)) {
-        return;
-    }
-
-    for (int32_t y = area->y1; y <= area->y2; ++y) {
-        auto* row = reinterpret_cast<uint16_t*>(
-            draw_buf->data + (y - area->y1) * draw_buf->header.stride);
-        int32_t visible_x1 = 0;
-        int32_t visible_x2 = 0;
-        if (!bsp_display_rounded_row_span(y, screen_width, screen_height,
-                                          BSP_LVGL_SCREEN_RADIUS, &visible_x1, &visible_x2)) {
-            memset(row, 0, static_cast<size_t>(width) * sizeof(uint16_t));
-            continue;
-        }
-
-        const int32_t clear_left_end = visible_x1 > area->x2 ? area->x2 : visible_x1 - 1;
-        const int32_t clear_right_start = visible_x2 < area->x1 ? area->x1 : visible_x2 + 1;
-        for (int32_t x = area->x1; x <= clear_left_end; ++x) {
-            row[x - area->x1] = 0;
-        }
-        for (int32_t x = clear_right_start; x <= area->x2; ++x) {
-            row[x - area->x1] = 0;
-        }
-    }
-}
-#endif
-
-}  // namespace
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
@@ -193,34 +124,6 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     // lv image cache, currently only PNG is supported
     size_t psram_size_mb = esp_psram_get_size() / 1024 / 1024;
     if (psram_size_mb >= 8) {
-#if CONFIG_LV_USE_BUILTIN_MALLOC
-        // Base TLSF pool is CONFIG_LV_MEM_SIZE_KILOBYTES in PSRAM; grow it so
-        // the 2MB decoded-image cache does not exhaust a 2MB-PSRAM-safe pool.
-        // TLSF rejects any single pool larger than LV_MEM_SIZE when
-        // LV_MEM_POOL_EXPAND_SIZE is 0 (block_size_max = 1 << ceil(log2(LV_MEM_SIZE))).
-        const size_t extra_total = 2560 * 1024;
-        const size_t chunk_size = LV_MEM_SIZE;
-        size_t added = 0;
-        while (added < extra_total) {
-            size_t this_chunk = extra_total - added;
-            if (this_chunk > chunk_size) {
-                this_chunk = chunk_size;
-            }
-            void* pool = heap_caps_malloc(this_chunk, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (pool == nullptr || lv_mem_add_pool(pool, this_chunk) == nullptr) {
-                if (pool != nullptr) {
-                    heap_caps_free(pool);
-                }
-                ESP_LOGE(TAG, "Failed to add %uKB LVGL PSRAM pool (added %uKB)",
-                         (unsigned)(this_chunk / 1024), (unsigned)(added / 1024));
-                break;
-            }
-            added += this_chunk;
-        }
-        if (added == extra_total) {
-            ESP_LOGI(TAG, "Added %uKB LVGL pool in PSRAM", (unsigned)(added / 1024));
-        }
-#endif
         lv_image_cache_resize(2 * 1024 * 1024, true);
         ESP_LOGI(TAG, "Use 2MB of PSRAM for image cache");
     } else if (psram_size_mb >= 2) {
@@ -238,9 +141,6 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
-    // SPI LCD still needs an internal DMA bounce buffer for PSRAM sources.
-    // A full-frame transfer (~150KB) cannot allocate that bounce buffer, so
-    // keep a small DMA strip in internal SRAM and partial refresh.
     const lvgl_port_display_cfg_t display_cfg = {
         .io_handle = panel_io_,
         .panel_handle = panel_,
@@ -274,14 +174,6 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
         ESP_LOGE(TAG, "Failed to add display");
         return;
     }
-
-#if CONFIG_BOARD_TYPE_FOLOTOY_AI_PASSPORT
-    // Mask the final RGB565 buffer rather than applying LVGL clip_corner. The
-    // latter allocates a full-screen ARGB layer, which is unsafe on C3.
-    lv_display_add_event_cb(display_, RoundedFlushEvent, LV_EVENT_FLUSH_START, nullptr);
-    ESP_LOGI(TAG, "AI Passport global screen radius=%d (outer corners black)",
-             BSP_LVGL_SCREEN_RADIUS);
-#endif
 
     if (offset_x != 0 || offset_y != 0) {
         lv_display_set_offset(display_, offset_x, offset_y);
@@ -416,18 +308,6 @@ LcdDisplay::~LcdDisplay() {
     }
     if (chat_message_label_ != nullptr) {
         lv_obj_del(chat_message_label_);
-    }
-    if (activation_qrcode_ != nullptr) {
-        lv_obj_del(activation_qrcode_);
-    }
-    if (activation_hint_label_ != nullptr) {
-        lv_obj_del(activation_hint_label_);
-    }
-    if (activation_site_label_ != nullptr) {
-        lv_obj_del(activation_site_label_);
-    }
-    if (activation_code_label_ != nullptr) {
-        lv_obj_del(activation_code_label_);
     }
     if (emoji_label_ != nullptr) {
         lv_obj_del(emoji_label_);
@@ -633,10 +513,6 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
     DisplayLockGuard lock(this);
-    if (content == nullptr || content[0] == '\0') {
-        HideActivationObjects(activation_qrcode_, activation_hint_label_, activation_site_label_,
-                              activation_code_label_);
-    }
     if (content_ == nullptr) {
         if (setup_ui_called_) {
             ESP_LOGW(TAG,
@@ -925,8 +801,6 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
-    HideActivationObjects(activation_qrcode_, activation_hint_label_, activation_site_label_,
-                          activation_code_label_);
     if (content_ == nullptr) {
         return;
     }
@@ -1183,10 +1057,6 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
     DisplayLockGuard lock(this);
-    if (content == nullptr || content[0] == '\0') {
-        HideActivationObjects(activation_qrcode_, activation_hint_label_, activation_site_label_,
-                              activation_code_label_);
-    }
     if (chat_message_label_ == nullptr) {
         if (setup_ui_called_) {
             ESP_LOGW(TAG,
@@ -1217,8 +1087,6 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
-    HideActivationObjects(activation_qrcode_, activation_hint_label_, activation_site_label_,
-                          activation_code_label_);
     // In non-wechat mode, just clear the chat message label and hide the bar
     if (chat_message_label_ != nullptr) {
         lv_label_set_text(chat_message_label_, "");
@@ -1228,132 +1096,6 @@ void LcdDisplay::ClearChatMessages() {
     }
 }
 #endif
-
-void LcdDisplay::ShowActivationCode(const char* code, const char* message) {
-    (void)message;
-    if (!setup_ui_called_) {
-        ESP_LOGW(TAG, "ShowActivationCode called before SetupUI()");
-        return;
-    }
-
-    DisplayLockGuard lock(this);
-    auto* theme = static_cast<LvglTheme*>(current_theme_);
-    const auto* text_font = theme->text_font()->font();
-    auto* screen = lv_screen_active();
-
-    if (emoji_box_ != nullptr) {
-        lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (preview_image_ != nullptr) {
-        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (bottom_bar_ != nullptr) {
-        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (activation_qrcode_ == nullptr) {
-        constexpr int kQrCanvasSize = 128;
-        constexpr int kQrMaxVersion = 5;
-        constexpr int kQrBufferLength = qrcodegen_BUFFER_LEN_FOR_VERSION(kQrMaxVersion);
-        activation_qrcode_ = lv_canvas_create(screen);
-        auto* qr_buffer = lv_draw_buf_create(kQrCanvasSize, kQrCanvasSize,
-                                             LV_COLOR_FORMAT_I1, LV_STRIDE_AUTO);
-        if (qr_buffer == nullptr) {
-            ESP_LOGE(TAG, "Failed to allocate activation QR buffer");
-            lv_obj_del(activation_qrcode_);
-            activation_qrcode_ = nullptr;
-            return;
-        }
-        lv_canvas_set_draw_buf(activation_qrcode_, qr_buffer);
-        lv_canvas_set_palette(activation_qrcode_, 0, lv_color_to_32(lv_color_white(), LV_OPA_COVER));
-        lv_canvas_set_palette(activation_qrcode_, 1, lv_color_to_32(lv_color_black(), LV_OPA_COVER));
-        lv_draw_buf_clear(qr_buffer, nullptr);
-        lv_obj_align(activation_qrcode_, LV_ALIGN_TOP_MID, 0, 52);
-        uint8_t qr_temp[kQrBufferLength] = {};
-        uint8_t qr_code[kQrBufferLength] = {};
-        if (!qrcodegen_encodeText(kActivationQrUrl, qr_temp, qr_code, qrcodegen_Ecc_MEDIUM, 1,
-                                  kQrMaxVersion, qrcodegen_Mask_AUTO, true)) {
-            ESP_LOGE(TAG, "Failed to encode activation QR data");
-            return;
-        }
-        const int qr_size = qrcodegen_getSize(qr_code);
-        const int qr_scale = kQrCanvasSize / (qr_size + 8);
-        const int qr_margin = (kQrCanvasSize - qr_size * qr_scale) / 2;
-        auto* qr_display = lv_obj_get_display(activation_qrcode_);
-        lv_display_enable_invalidation(qr_display, false);
-        for (int y = 0; y < qr_size; ++y) {
-            for (int x = 0; x < qr_size; ++x) {
-                if (!qrcodegen_getModule(qr_code, x, y)) {
-                    continue;
-                }
-                for (int dy = 0; dy < qr_scale; ++dy) {
-                    for (int dx = 0; dx < qr_scale; ++dx) {
-                        // LV_COLOR_FORMAT_I1 stores the palette index in the
-                        // blue component. Index 1 is the black palette entry;
-                        // lv_color_black() has blue=0 and would therefore
-                        // write the white background index.
-                        lv_canvas_set_px(activation_qrcode_, qr_margin + x * qr_scale + dx,
-                                         qr_margin + y * qr_scale + dy, lv_color_hex(1),
-                                         LV_OPA_COVER);
-                    }
-                }
-            }
-        }
-        lv_display_enable_invalidation(qr_display, true);
-        lv_obj_invalidate(activation_qrcode_);
-    }
-    if (activation_hint_label_ == nullptr) {
-        activation_hint_label_ = lv_label_create(screen);
-        lv_obj_set_width(activation_hint_label_, LV_HOR_RES - 20);
-        lv_obj_set_style_text_font(activation_hint_label_, text_font, 0);
-        lv_obj_set_style_text_align(activation_hint_label_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(activation_hint_label_, theme->text_color(), 0);
-        lv_label_set_text(activation_hint_label_, "请扫码绑定设备");
-        lv_obj_align(activation_hint_label_, LV_ALIGN_TOP_MID, 0, 185);
-    }
-    if (activation_site_label_ == nullptr) {
-        activation_site_label_ = lv_label_create(screen);
-        lv_obj_set_width(activation_site_label_, LV_HOR_RES - 20);
-        lv_obj_set_style_text_font(activation_site_label_, text_font, 0);
-        lv_obj_set_style_text_align(activation_site_label_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(activation_site_label_, theme->text_color(), 0);
-        lv_label_set_text(activation_site_label_, "或打开 xiaozhi.me\n输入下方激活码");
-        lv_obj_align(activation_site_label_, LV_ALIGN_TOP_MID, 0, 216);
-    }
-    if (activation_code_label_ == nullptr) {
-        activation_code_label_ = lv_label_create(screen);
-        lv_obj_set_width(activation_code_label_, LV_HOR_RES - 20);
-        lv_obj_set_style_text_font(activation_code_label_, text_font, 0);
-        lv_obj_set_style_text_align(activation_code_label_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(activation_code_label_, theme->text_color(), 0);
-        lv_obj_align(activation_code_label_, LV_ALIGN_TOP_MID, 0, 278);
-    }
-
-    std::string code_text = "激活码：";
-    code_text += (code != nullptr ? code : "");
-    lv_label_set_text(activation_code_label_, code_text.c_str());
-    lv_obj_clear_flag(activation_qrcode_, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(activation_hint_label_, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(activation_site_label_, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(activation_code_label_, LV_OBJ_FLAG_HIDDEN);
-}
-
-void LcdDisplay::ClearActivationCode() {
-    if (!setup_ui_called_) {
-        return;
-    }
-
-    DisplayLockGuard lock(this);
-    HideActivationObjects(activation_qrcode_, activation_hint_label_, activation_site_label_,
-                          activation_code_label_);
-
-    // Show the normal centered emotion again after the activation page. Do
-    // not reveal it over a currently displayed preview image.
-    if (emoji_box_ != nullptr &&
-        (preview_image_ == nullptr || lv_obj_has_flag(preview_image_, LV_OBJ_FLAG_HIDDEN))) {
-        lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-    }
-}
 
 void LcdDisplay::SetEmotion(const char* emotion) {
     if (!setup_ui_called_) {

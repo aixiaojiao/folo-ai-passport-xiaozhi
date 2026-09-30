@@ -29,10 +29,6 @@ protected:
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
-    lv_obj_t* activation_qrcode_ = nullptr;
-    lv_obj_t* activation_hint_label_ = nullptr;
-    lv_obj_t* activation_site_label_ = nullptr;
-    lv_obj_t* activation_code_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
@@ -50,8 +46,6 @@ public:
     ~LcdDisplay();
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
-    virtual void ShowActivationCode(const char* code, const char* message) override;
-    virtual void ClearActivationCode() override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
@@ -59,7 +53,7 @@ public:
     virtual void SetTheme(Theme* theme) override;
 
     // Set whether to hide chat messages/subtitles
-    virtual void SetHideSubtitle(bool hide) override;
+    void SetHideSubtitle(bool hide);
 };
 
 // SPI LCD display

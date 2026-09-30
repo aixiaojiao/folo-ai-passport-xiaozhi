@@ -90,19 +90,16 @@ bool LvglDisplay::AddTextGlyphs(const std::vector<TextGlyph>& glyphs, uint8_t bp
     }
 
     DisplayLockGuard lock(this);
-    if (!lock || current_theme_ == nullptr) {
-        return false;
-    }
-    auto text_font = current_theme_->GetTextFont();
-    if (text_font == nullptr) {
+    auto theme = dynamic_cast<LvglTheme*>(current_theme_);
+    if (theme == nullptr || theme->text_font() == nullptr) {
         return false;
     }
 
-    auto fallback = dynamic_glyph_cache_->EnsureFont(text_font->font(), bpp);
+    auto fallback = dynamic_glyph_cache_->EnsureFont(theme->text_font()->font(), bpp);
     if (fallback == nullptr) {
         return false;
     }
-    text_font->SetFallback(fallback);
+    theme->text_font()->SetFallback(fallback);
     return dynamic_glyph_cache_->AddGlyphs(glyphs);
 }
 
@@ -213,25 +210,22 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         }
     }
 
-    // Update time — show HH:MM when idle; refresh immediately on state
-    // transitions (update_all=true) and on every minute change thereafter.
+    // Update time
     if (app.GetDeviceState() == kDeviceStateIdle) {
-        time_t now = time(NULL);
-        struct tm* tm_now = localtime(&now);
-        if (tm_now->tm_year >= 2025 - 1900) {
-            int cur_min = tm_now->tm_hour * 60 + tm_now->tm_min;
-            if (update_all || cur_min != last_displayed_clock_min_) {
-                last_displayed_clock_min_ = cur_min;
+        if (last_status_update_time_ + std::chrono::seconds(10) <
+            std::chrono::system_clock::now()) {
+            // Set status to clock "HH:MM"
+            time_t now = time(NULL);
+            struct tm* tm = localtime(&now);
+            // Check if the we have already set the time
+            if (tm->tm_year >= 2025 - 1900) {
                 char time_str[16];
-                strftime(time_str, sizeof(time_str), "%H:%M", tm_now);
+                strftime(time_str, sizeof(time_str), "%H:%M", tm);
                 SetStatus(time_str);
+            } else {
+                ESP_LOGW(TAG, "System time is not set, tm_year: %d", tm->tm_year);
             }
-        } else {
-            ESP_LOGW(TAG, "System time not set (tm_year=%d)", tm_now->tm_year);
         }
-    } else {
-        // Reset so the clock re-appears immediately when idle resumes.
-        last_displayed_clock_min_ = -1;
     }
 
     esp_pm_lock_acquire(pm_lock_);
