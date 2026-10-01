@@ -96,6 +96,10 @@ public:
      * Sends MAIN_EVENT_TOGGLE_CHAT to be handled in Run()
      */
     void ToggleChatState();
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    // Call from the main task, including scheduled button callbacks.
+    void WakeDisplay();
+#endif
 
     /**
      * Start listening (event-based, thread-safe)
@@ -160,6 +164,10 @@ private:
     uint32_t tts_dropped_packets_ = 0;
     std::atomic<uint32_t> protocol_generation_ = 0;
     int clock_ticks_ = 0;
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    int64_t last_screen_activity_us_ = 0;
+    bool screen_off_ = false;
+#endif
     TaskHandle_t activation_task_handle_ = nullptr;
 
     // Event handlers
