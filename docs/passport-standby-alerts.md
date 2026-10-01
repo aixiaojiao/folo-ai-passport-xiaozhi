@@ -12,6 +12,12 @@ python scripts/build.py folo/ai-passport-c3 --name folo-ai-passport-c3 --languag
 
 Disable wake words for an alarm-only installation so speaker playback cannot wake a new conversation. The button still starts an intentional conversation. Preserve the current device's NVS when installing the resulting firmware, including Wi-Fi credentials, server endpoint and volume settings; never commit those contents.
 
+## Idle backlight
+
+The Passport turns off its backlight after 30 seconds idle with audio playback drained. Announcements and active device states restore the user's saved brightness; returning to idle starts a new 30-second interval. All three buttons wake the display and restart the interval while retaining their existing volume and conversation actions. This policy applies with USB or battery power because the board has no charging-state detection.
+
+Turning the backlight off does not stop the CPU, Wi-Fi or standby WebSocket, and does not clear announcement history. The temporary zero brightness is not saved to NVS. Real-device acceptance must observe the backlight switching off, a new announcement waking it, and another shutdown after playback; serial backlight commands support the check but do not alone prove the physical screen state or battery runtime.
+
 ## Announcement screen
 
 The Passport board profile uses the existing multi-message layout. Announcements use the main screen area, wrap across lines, and remain after playback finishes. Once the content exceeds the screen height, the viewport scrolls upward to show the newest text. Emoji overlays are hidden; network, status and battery indicators remain at the top.

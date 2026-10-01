@@ -6,13 +6,13 @@
 #include "display/lcd_display.h"
 #include "wifi_board.h"
 
-#include <button_adc.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
+#include <button_adc.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -141,16 +141,19 @@ private:
 
         adc_buttons_[kVolumeUpButton]->OnClick([]() {
             Application::GetInstance().Schedule([]() {
+                Application::GetInstance().WakeDisplay();
                 static_cast<FoloAiPassportC3Board&>(Board::GetInstance()).ChangeVolume(10);
             });
         });
         adc_buttons_[kVolumeDownButton]->OnClick([]() {
             Application::GetInstance().Schedule([]() {
+                Application::GetInstance().WakeDisplay();
                 static_cast<FoloAiPassportC3Board&>(Board::GetInstance()).ChangeVolume(-10);
             });
         });
         adc_buttons_[kConfirmButton]->OnClick([]() {
             Application::GetInstance().Schedule([]() {
+                Application::GetInstance().WakeDisplay();
                 static_cast<FoloAiPassportC3Board&>(Board::GetInstance()).ToggleChatState();
             });
         });
@@ -168,9 +171,8 @@ private:
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
-        ESP_ERROR_CHECK(
-            esp_lcd_new_panel_io_spi(static_cast<esp_lcd_spi_bus_handle_t>(DISPLAY_SPI_HOST),
-                                     &io_config, &panel_io));
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
+            static_cast<esp_lcd_spi_bus_handle_t>(DISPLAY_SPI_HOST), &io_config, &panel_io));
 
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = DISPLAY_RESET_PIN;
@@ -182,8 +184,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
         for (const auto& init_command : kSt7789P3InitCommands) {
             ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(panel_io, init_command.command,
-                                                      init_command.data,
-                                                      init_command.data_length));
+                                                      init_command.data, init_command.data_length));
             if (init_command.delay_ms > 0) {
                 vTaskDelay(pdMS_TO_TICKS(init_command.delay_ms));
             }
@@ -208,15 +209,12 @@ public:
     AudioCodec* GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(
             codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
-            AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN,
-            AUDIO_CODEC_ES8311_ADDR);
+            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT,
+            AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
         return &audio_codec;
     }
 
-    Display* GetDisplay() override {
-        return display_;
-    }
+    Display* GetDisplay() override { return display_; }
 
     Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);

@@ -19,6 +19,9 @@
 #include <limits>
 
 #define TAG "Application"
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+static constexpr int64_t kScreenIdleTimeoutUs = 30 * 1000 * 1000;
+#endif
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -212,6 +215,11 @@ void Application::Run() {
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+                if (GetDeviceState() == kDeviceStateIdle) {
+                    last_screen_activity_us_ = esp_timer_get_time();
+                }
+#endif
             }
             if (pending_passive_tts_finish_ && GetDeviceState() == kDeviceStateSpeaking &&
                 audio_service_.IsPlaybackIdle()) {
@@ -279,6 +287,20 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+            if (GetDeviceState() == kDeviceStateIdle && !screen_off_) {
+                const int64_t now = esp_timer_get_time();
+                if (!audio_service_.IsPlaybackIdle()) {
+                    last_screen_activity_us_ = now;
+                } else if (now - last_screen_activity_us_ >= kScreenIdleTimeoutUs) {
+                    if (auto backlight = Board::GetInstance().GetBacklight()) {
+                        backlight->SetBrightness(0, false);
+                        screen_off_ = true;
+                        ESP_LOGI(TAG, "Idle screen off after 30 seconds; network remains active");
+                    }
+                }
+            }
+#endif
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -649,6 +671,9 @@ void Application::InitializeProtocol() {
                         ESP_LOGW(TAG, "Ignoring TTS start outside an audio-ready state");
                         return;
                     }
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+                    WakeDisplay();
+#endif
                     passive_tts_ = state == kDeviceStateIdle ||
                                    (state == kDeviceStateSpeaking && passive_tts_);
                     pending_passive_tts_finish_ = false;
@@ -816,6 +841,19 @@ void Application::DismissAlert() {
 }
 
 void Application::ToggleChatState() { xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT); }
+
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+void Application::WakeDisplay() {
+    last_screen_activity_us_ = esp_timer_get_time();
+    if (screen_off_) {
+        if (auto backlight = Board::GetInstance().GetBacklight()) {
+            backlight->RestoreBrightness();
+        }
+        screen_off_ = false;
+        ESP_LOGI(TAG, "Screen wake; restored saved brightness");
+    }
+}
+#endif
 
 void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
 
@@ -1051,6 +1089,13 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    if (new_state == kDeviceStateIdle) {
+        last_screen_activity_us_ = esp_timer_get_time();
+    } else {
+        WakeDisplay();
+    }
+#endif
 
     switch (new_state) {
         case kDeviceStateUnknown:
