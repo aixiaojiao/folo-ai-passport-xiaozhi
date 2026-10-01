@@ -313,11 +313,17 @@ void Application::Run() {
 }
 
 void Application::HandleNetworkConnectedEvent() {
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    network_connected_ = true;
+#endif
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
         // Network is ready, start activation
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+        protocol_initialized_ = false;
+#endif
         SetDeviceState(kDeviceStateActivating);
         if (activation_task_handle_ != nullptr) {
             ESP_LOGW(TAG, "Activation task already running");
@@ -340,6 +346,9 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    network_connected_ = false;
+#endif
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -357,6 +366,10 @@ void Application::HandleNetworkDisconnectedEvent() {
 }
 
 void Application::HandleActivationDoneEvent() {
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    // The worker has finished publishing the protocol before this main-task event.
+    protocol_initialized_ = true;
+#endif
     ESP_LOGI(TAG, "Activation done");
 
     SystemInfo::PrintHeapStats();
@@ -852,6 +865,13 @@ void Application::WakeDisplay() {
         screen_off_ = false;
         ESP_LOGI(TAG, "Screen wake; restored saved brightness");
     }
+    Board::GetInstance().GetDisplay()->UpdateStatusBar(true);
+}
+
+bool Application::IsAlertServiceConnected() const {
+    // DeviceState can change during activation; only its completion event publishes readiness.
+    return network_connected_ && protocol_initialized_ && protocol_ != nullptr &&
+           protocol_->IsAudioChannelOpened();
 }
 #endif
 
@@ -1155,6 +1175,9 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    display->UpdateStatusBar(true);
+#endif
 }
 
 void Application::StartListeningAudio() {
