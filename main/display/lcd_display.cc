@@ -1039,10 +1039,9 @@ void LcdDisplay::UpdateStatusBar(bool update_all) {
     const bool starting = !app.IsProtocolInitialized() || state == kDeviceStateWifiConfiguring;
     const uint64_t uptime_seconds = static_cast<uint64_t>(esp_timer_get_time() / 1000000);
     char uptime[32];
-    snprintf(uptime, sizeof(uptime), "%02llu:%02llu:%02llu",
-             static_cast<unsigned long long>(uptime_seconds / 3600),
-             static_cast<unsigned long long>((uptime_seconds / 60) % 60),
-             static_cast<unsigned long long>(uptime_seconds % 60));
+    snprintf(uptime, sizeof(uptime), "%02u:%02u:%02u", static_cast<unsigned>(uptime_seconds / 3600),
+             static_cast<unsigned>((uptime_seconds / 60) % 60),
+             static_cast<unsigned>(uptime_seconds % 60));
 
     char connection[80];
     if (starting) {
@@ -1063,8 +1062,9 @@ void LcdDisplay::UpdateStatusBar(bool update_all) {
                  state == kDeviceStateConnecting ? "报警连接中" : "报警未连");
     }
     const char* wifi = network_connected ? "WiFi已连" : (starting ? "WiFi..." : "WiFi未连");
+    const char* runtime_caption = starting ? "" : "运行";
     char text[160];
-    snprintf(text, sizeof(text), "%s\n%s %s", connection, wifi, uptime);
+    snprintf(text, sizeof(text), "%s\n%s %s%s", connection, wifi, runtime_caption, uptime);
 
     DisplayLockGuard lock(this);
     lv_label_set_text(runtime_status_label_, text);
@@ -1075,8 +1075,8 @@ void LcdDisplay::UpdateStatusBar(bool update_all) {
         lv_obj_update_layout(runtime_status_label_);
         lv_area_t area;
         lv_obj_get_coords(runtime_status_label_, &area);
-        ESP_LOGI(TAG, "Runtime status: %s | %s %s; x=%ld y=%ld w=%ld h=%ld", connection, wifi,
-                 uptime, static_cast<long>(area.x1), static_cast<long>(area.y1),
+        ESP_LOGI(TAG, "Runtime status: %s | %s %s%s; x=%ld y=%ld w=%ld h=%ld", connection, wifi,
+                 runtime_caption, uptime, static_cast<long>(area.x1), static_cast<long>(area.y1),
                  static_cast<long>(lv_obj_get_width(runtime_status_label_)),
                  static_cast<long>(lv_obj_get_height(runtime_status_label_)));
         last_runtime_state_ = static_cast<int>(state);
