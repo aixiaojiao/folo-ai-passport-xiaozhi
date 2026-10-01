@@ -3,10 +3,19 @@
 #include <esp_log.h>
 #include <algorithm>
 #include <iterator>
+#include "sdkconfig.h"
 
 #define TAG "DynamicGlyphCache"
 
-DynamicGlyphCache::DynamicGlyphCache() : retain_between_batches_(TextGlyphStorageUsesPsram()) {}
+DynamicGlyphCache::DynamicGlyphCache() : retain_between_batches_(TextGlyphStorageUsesPsram()) {
+#if CONFIG_USE_WECHAT_MESSAGE_STYLE
+    retain_between_batches_ = true;
+    if (!TextGlyphStorageUsesPsram()) {
+        max_glyphs_ = 64;
+        max_bitmap_bytes_ = 8 * 1024;
+    }
+#endif
+}
 
 lv_font_t* DynamicGlyphCache::EnsureFont(const lv_font_t* base_font, uint8_t bpp) {
     if (base_font == nullptr || (bpp != 1 && bpp != 4)) {
@@ -61,7 +70,8 @@ bool DynamicGlyphCache::AddGlyphs(const std::vector<TextGlyph>& glyphs) {
     size_t bitmap_bytes = BitmapBytes();
     for (const auto& glyph : glyphs) {
         const size_t expected = (static_cast<size_t>(glyph.box_w) * glyph.box_h * bpp_ + 7) / 8;
-        if (glyph.codepoint == 0 || glyph.codepoint > 0x10FFFF || glyph.bitmap.size() != expected) {
+        if (glyph.codepoint == 0 || glyph.codepoint > 0x10FFFF || glyph.bitmap.size() != expected ||
+            expected > max_bitmap_bytes_) {
             ESP_LOGW(TAG, "Rejected glyph U+%04lX", static_cast<unsigned long>(glyph.codepoint));
             continue;
         }
@@ -71,10 +81,20 @@ bool DynamicGlyphCache::AddGlyphs(const std::vector<TextGlyph>& glyphs) {
             [&glyph](const Entry& entry) { return entry.codepoint == glyph.codepoint; });
         if (existing != entries_.end()) {
             bitmap_bytes -= existing->bitmap.size();
-        } else {
-            entries_.emplace_back();
-            existing = std::prev(entries_.end());
+            entries_.erase(existing);
         }
+
+        // Make room before copying each bitmap, never after copying the whole batch.
+        while (!entries_.empty() &&
+               (entries_.size() >= max_glyphs_ || bitmap_bytes + expected > max_bitmap_bytes_)) {
+            auto oldest = std::min_element(
+                entries_.begin(), entries_.end(),
+                [](const Entry& a, const Entry& b) { return a.last_use < b.last_use; });
+            bitmap_bytes -= oldest->bitmap.size();
+            entries_.erase(oldest);
+        }
+        entries_.emplace_back();
+        existing = std::prev(entries_.end());
         existing->codepoint = glyph.codepoint;
         existing->adv_w = glyph.adv_w;
         existing->box_w = glyph.box_w;
@@ -87,16 +107,6 @@ bool DynamicGlyphCache::AddGlyphs(const std::vector<TextGlyph>& glyphs) {
         changed = true;
     }
 
-    while (entries_.size() > kMaxGlyphs || bitmap_bytes > kMaxBitmapBytes) {
-        auto oldest = std::min_element(
-            entries_.begin(), entries_.end(),
-            [](const Entry& a, const Entry& b) { return a.last_use < b.last_use; });
-        if (oldest == entries_.end()) {
-            break;
-        }
-        bitmap_bytes -= oldest->bitmap.size();
-        entries_.erase(oldest);
-    }
     if (changed) {
         Rebuild();
     }
@@ -125,8 +135,6 @@ void DynamicGlyphCache::Rebuild() {
     unicode_list_.clear();
     glyph_dsc_.clear();
     cmaps_.clear();
-    glyph_dsc_.push_back(lv_font_fmt_txt_glyph_dsc_t{});
-
     struct Range {
         uint32_t start;
         uint32_t list_begin;
@@ -134,28 +142,39 @@ void DynamicGlyphCache::Rebuild() {
         uint16_t count;
     };
     TextGlyphVector<Range> ranges;
+    uint32_t entry_index = 0;
     for (const auto& entry : entries_) {
         if (ranges.empty() || entry.codepoint - ranges.back().start > 0xFFFE) {
-            ranges.push_back(Range{entry.codepoint, static_cast<uint32_t>(unicode_list_.size()),
-                                   entry.codepoint, 0});
+            ranges.push_back(Range{entry.codepoint, entry_index, entry.codepoint, 0});
         }
         auto& range = ranges.back();
-        unicode_list_.push_back(static_cast<uint16_t>(entry.codepoint - range.start));
         range.last = entry.codepoint;
         ++range.count;
-
-        lv_font_fmt_txt_glyph_dsc_t glyph_dsc{};
-        glyph_dsc.bitmap_index = bitmap_blob_.size();
-        glyph_dsc.adv_w = entry.adv_w;
-        glyph_dsc.box_w = entry.box_w;
-        glyph_dsc.box_h = entry.box_h;
-        glyph_dsc.ofs_x = entry.ofs_x;
-        glyph_dsc.ofs_y = entry.ofs_y;
-        glyph_dsc_.push_back(glyph_dsc);
-        bitmap_blob_.insert(bitmap_blob_.end(), entry.bitmap.begin(), entry.bitmap.end());
+        ++entry_index;
     }
 
+    // Reserve the final sizes before filling, avoiding geometric growth of bitmap copies.
+    bitmap_blob_.reserve(BitmapBytes());
+    unicode_list_.reserve(entries_.size());
+    glyph_dsc_.reserve(entries_.size() + 1);
+    cmaps_.reserve(ranges.size());
+    glyph_dsc_.push_back(lv_font_fmt_txt_glyph_dsc_t{});
     for (const auto& range : ranges) {
+        for (uint32_t i = range.list_begin; i < range.list_begin + range.count; ++i) {
+            const auto& entry = entries_[i];
+            unicode_list_.push_back(static_cast<uint16_t>(entry.codepoint - range.start));
+
+            lv_font_fmt_txt_glyph_dsc_t glyph_dsc{};
+            glyph_dsc.bitmap_index = bitmap_blob_.size();
+            glyph_dsc.adv_w = entry.adv_w;
+            glyph_dsc.box_w = entry.box_w;
+            glyph_dsc.box_h = entry.box_h;
+            glyph_dsc.ofs_x = entry.ofs_x;
+            glyph_dsc.ofs_y = entry.ofs_y;
+            glyph_dsc_.push_back(glyph_dsc);
+            bitmap_blob_.insert(bitmap_blob_.end(), entry.bitmap.begin(), entry.bitmap.end());
+        }
+
         lv_font_fmt_txt_cmap_t cmap{};
         cmap.range_start = range.start;
         cmap.range_length = static_cast<uint16_t>(range.last - range.start + 1);

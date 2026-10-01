@@ -80,9 +80,11 @@ bool LvglDisplay::AddTextGlyphs(const std::vector<TextGlyph>& glyphs, uint8_t bp
         return false;
     }
     if (glyphs.empty()) {
+#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
         if (!TextGlyphStorageUsesPsram()) {
             ClearTextGlyphs();
         }
+#endif
         return false;
     }
     if (bpp != 1 && bpp != 4) {

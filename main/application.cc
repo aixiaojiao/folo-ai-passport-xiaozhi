@@ -1056,8 +1056,10 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();    // Clear messages first
-            display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
+#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
+            display->ClearChatMessages();
+#endif
+            display->SetEmotion("neutral");
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);

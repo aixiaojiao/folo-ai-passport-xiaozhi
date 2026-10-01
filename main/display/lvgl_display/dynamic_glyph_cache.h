@@ -35,6 +35,8 @@ private:
 
     bool initialized_ = false;
     bool retain_between_batches_ = false;
+    size_t max_glyphs_ = kMaxGlyphs;
+    size_t max_bitmap_bytes_ = kMaxBitmapBytes;
     uint8_t bpp_ = 0;
     uint64_t use_counter_ = 0;
     lv_font_t font_{};
