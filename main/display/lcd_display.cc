@@ -1,4 +1,5 @@
 #include "lcd_display.h"
+#include "application.h"
 #include "assets/lang_config.h"
 #include "gif/lvgl_gif.h"
 #include "lvgl_theme.h"
@@ -12,6 +13,7 @@
 #include <noto_emoji.h>
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -291,6 +293,11 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    if (runtime_status_label_ != nullptr) {
+        lv_obj_del(runtime_status_label_);
+    }
+#endif
 
     // Clean up GIF controller
     if (gif_controller_) {
@@ -456,6 +463,20 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
+
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    // A fixed status row, independent of transient notifications and scrollable history.
+    runtime_status_label_ = lv_label_create(container_);
+    lv_obj_set_width(runtime_status_label_, lv_pct(100));
+    lv_label_set_long_mode(runtime_status_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(runtime_status_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_left(runtime_status_label_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_right(runtime_status_label_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_top(runtime_status_label_, lvgl_theme->spacing(2), 0);
+    lv_obj_set_style_pad_bottom(runtime_status_label_, lvgl_theme->spacing(2), 0);
+    // Inherit the screen text font/color so assets and theme changes update this label too.
+    lv_label_set_text(runtime_status_label_, "连接中\nWiFi 00:00:00");
+#endif
 
     /* Content - Chat area */
     content_ = lv_obj_create(container_);
@@ -1000,6 +1021,68 @@ void LcdDisplay::ClearChatMessages() {
     }
     if (bottom_bar_ != nullptr) {
         lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+#endif
+
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+void LcdDisplay::UpdateStatusBar(bool update_all) {
+    LvglDisplay::UpdateStatusBar(update_all);
+    if (runtime_status_label_ == nullptr) {
+        return;
+    }
+
+    auto& app = Application::GetInstance();
+    const auto state = app.GetDeviceState();
+    const bool network_connected = app.IsNetworkConnected();
+    const bool service_connected = app.IsAlertServiceConnected();
+    const bool starting = !app.IsProtocolInitialized() || state == kDeviceStateWifiConfiguring;
+    const uint64_t uptime_seconds = static_cast<uint64_t>(esp_timer_get_time() / 1000000);
+    char uptime[32];
+    snprintf(uptime, sizeof(uptime), "%02llu:%02llu:%02llu",
+             static_cast<unsigned long long>(uptime_seconds / 3600),
+             static_cast<unsigned long long>((uptime_seconds / 60) % 60),
+             static_cast<unsigned long long>(uptime_seconds % 60));
+
+    char connection[80];
+    if (starting) {
+        // These startup characters are in the built-in basic font, before assets are applied.
+        snprintf(connection, sizeof(connection), "连接中");
+    } else if (service_connected) {
+        const char* activity = Lang::Strings::STANDBY;
+        if (state == kDeviceStateSpeaking || state == kDeviceStateNotifying) {
+            activity = "播报中";
+        } else if (state == kDeviceStateListening) {
+            activity = Lang::Strings::LISTENING;
+        } else if (state == kDeviceStateConnecting) {
+            activity = Lang::Strings::CONNECTING;
+        }
+        snprintf(connection, sizeof(connection), "报警已连·%s", activity);
+    } else {
+        snprintf(connection, sizeof(connection), "%s",
+                 state == kDeviceStateConnecting ? "报警连接中" : "报警未连");
+    }
+    const char* wifi = network_connected ? "WiFi已连" : (starting ? "WiFi..." : "WiFi未连");
+    char text[160];
+    snprintf(text, sizeof(text), "%s\n%s %s", connection, wifi, uptime);
+
+    DisplayLockGuard lock(this);
+    lv_label_set_text(runtime_status_label_, text);
+    const int64_t log_slot = uptime_seconds / 10;
+    if (last_runtime_state_ != static_cast<int>(state) ||
+        last_network_connected_ != network_connected ||
+        last_service_connected_ != service_connected || last_runtime_log_slot_ != log_slot) {
+        lv_obj_update_layout(runtime_status_label_);
+        lv_area_t area;
+        lv_obj_get_coords(runtime_status_label_, &area);
+        ESP_LOGI(TAG, "Runtime status: %s | %s %s; x=%ld y=%ld w=%ld h=%ld", connection, wifi,
+                 uptime, static_cast<long>(area.x1), static_cast<long>(area.y1),
+                 static_cast<long>(lv_obj_get_width(runtime_status_label_)),
+                 static_cast<long>(lv_obj_get_height(runtime_status_label_)));
+        last_runtime_state_ = static_cast<int>(state);
+        last_network_connected_ = network_connected;
+        last_service_connected_ = service_connected;
+        last_runtime_log_slot_ = log_slot;
     }
 }
 #endif

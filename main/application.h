@@ -99,6 +99,9 @@ public:
 #if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
     // Call from the main task, including scheduled button callbacks.
     void WakeDisplay();
+    bool IsNetworkConnected() const { return network_connected_; }
+    bool IsProtocolInitialized() const { return protocol_initialized_; }
+    bool IsAlertServiceConnected() const;
 #endif
 
     /**
@@ -167,6 +170,8 @@ private:
 #if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
     int64_t last_screen_activity_us_ = 0;
     bool screen_off_ = false;
+    bool network_connected_ = false;
+    bool protocol_initialized_ = false;
 #endif
     TaskHandle_t activation_task_handle_ = nullptr;
 

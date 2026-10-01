@@ -19,6 +19,13 @@ protected:
     lv_draw_buf_t draw_buf_;
     lv_obj_t* top_bar_ = nullptr;
     lv_obj_t* status_bar_ = nullptr;
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    lv_obj_t* runtime_status_label_ = nullptr;
+    int last_runtime_state_ = -1;
+    bool last_network_connected_ = false;
+    bool last_service_connected_ = false;
+    int64_t last_runtime_log_slot_ = -1;
+#endif
     lv_obj_t* content_ = nullptr;
     lv_obj_t* container_ = nullptr;
     lv_obj_t* side_bar_ = nullptr;
@@ -49,6 +56,9 @@ public:
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    void UpdateStatusBar(bool update_all = false) override;
+#endif
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;
 
