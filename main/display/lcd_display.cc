@@ -494,220 +494,127 @@ void LcdDisplay::SetupUI() {
     emoji_image_ = lv_img_create(screen);
     lv_obj_align(emoji_image_, LV_ALIGN_TOP_MID, 0,
                  text_font->line_height + lvgl_theme->spacing(8));
+    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
-    // Display AI logo while booting
+    // Keep the announcement area free of the central logo from startup.
     emoji_label_ = lv_label_create(screen);
     lv_obj_center(emoji_label_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define MAX_MESSAGES 40
 #else
 #define MAX_MESSAGES 20
 #endif
+static constexpr size_t kMaxHistoryTextBytes = 8 * 1024;
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
+    if (role == nullptr || content == nullptr || content[0] == '\0') {
+        return;
+    }
+    if (strcmp(role, "system") == 0) {
+        // Transient system information belongs in the status area, not in broadcast history.
+        ShowNotification(content);
+        return;
+    }
     if (!setup_ui_called_) {
-        ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
-                 role, content);
+        ESP_LOGW(TAG, "SetChatMessage called before SetupUI() - message will be lost!");
+        return;
     }
     DisplayLockGuard lock(this);
     if (content_ == nullptr) {
-        if (setup_ui_called_) {
-            ESP_LOGW(TAG,
-                     "SetChatMessage('%s', '%s') failed: content_ is nullptr (SetupUI() was called "
-                     "but container not created)",
-                     role, content);
-        }
+        ESP_LOGW(TAG, "SetChatMessage failed: content_ is nullptr");
         return;
     }
 
-    // Check if message count exceeds limit
-    uint32_t child_count = lv_obj_get_child_cnt(content_);
-    if (child_count >= MAX_MESSAGES) {
-        // Delete the oldest message (first child object)
-        lv_obj_t* first_child = lv_obj_get_child(content_, 0);
-        if (first_child != nullptr) {
-            lv_obj_del(first_child);
-            // Refresh child count after deletion
-            child_count = lv_obj_get_child_cnt(content_);
+    const size_t original_bytes = strlen(content);
+    const char* record_text = content;
+    if (original_bytes > kMaxHistoryTextBytes) {
+        record_text += original_bytes - kMaxHistoryTextBytes;
+        // Start at a complete UTF-8 code point, keeping the newest part of a long record.
+        while ((static_cast<unsigned char>(*record_text) & 0xC0) == 0x80) {
+            ++record_text;
         }
-        // Scroll to the last message immediately (get last_child after deletion)
-        if (child_count > 0) {
-            lv_obj_t* last_child = lv_obj_get_child(content_, child_count - 1);
-            if (last_child != nullptr && lv_obj_is_valid(last_child)) {
-                lv_obj_scroll_to_view_recursive(last_child, LV_ANIM_OFF);
-            }
+        ESP_LOGW(TAG, "History text truncated: original_bytes=%lu retained_bytes=%lu",
+                 static_cast<unsigned long>(original_bytes),
+                 static_cast<unsigned long>(strlen(record_text)));
+    }
+    const size_t record_bytes = strlen(record_text);
+    auto text_bytes = [](lv_obj_t* record) -> size_t {
+        auto bubble = record;
+        if (lv_obj_get_user_data(bubble) == nullptr && lv_obj_get_child_cnt(bubble) > 0) {
+            bubble = lv_obj_get_child(bubble, 0);  // User message wrapper.
         }
+        if (lv_obj_get_child_cnt(bubble) == 0) {
+            return 0;
+        }
+        auto label = lv_obj_get_child(bubble, 0);
+        return lv_obj_check_type(label, &lv_label_class) ? strlen(lv_label_get_text(label)) : 0;
+    };
+    size_t history_bytes = 0;
+    for (uint32_t i = 0; i < lv_obj_get_child_cnt(content_); ++i) {
+        history_bytes += text_bytes(lv_obj_get_child(content_, i));
     }
 
-    // Collapse system messages (if it's a system message, check if the last message is also a
-    // system message)
-    if (strcmp(role, "system") == 0) {
-        // Refresh child count to get accurate count after potential deletion above
-        child_count = lv_obj_get_child_cnt(content_);
-        if (child_count > 0) {
-            // Get the last message container
-            lv_obj_t* last_container = lv_obj_get_child(content_, child_count - 1);
-            if (last_container != nullptr && lv_obj_is_valid(last_container) &&
-                lv_obj_get_child_cnt(last_container) > 0) {
-                // Get the bubble inside the container
-                lv_obj_t* last_bubble = lv_obj_get_child(last_container, 0);
-                if (last_bubble != nullptr && lv_obj_is_valid(last_bubble)) {
-                    // Check if bubble type is system message
-                    void* bubble_type_ptr = lv_obj_get_user_data(last_bubble);
-                    if (bubble_type_ptr != nullptr &&
-                        strcmp((const char*)bubble_type_ptr, "system") == 0) {
-                        // If the last message is also a system message, delete it
-                        lv_obj_del(last_container);
-                    }
-                }
-            }
-        }
-    } else {
-        // Hide the centered AI logo
-        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    // Avoid empty message boxes
-    if (strlen(content) == 0) {
-        return;
+    // Every received sentence is a separate record, even when the text repeats.
+    while (lv_obj_get_child_cnt(content_) > 0 &&
+           (lv_obj_get_child_cnt(content_) >= MAX_MESSAGES ||
+            history_bytes + record_bytes > kMaxHistoryTextBytes)) {
+        auto oldest = lv_obj_get_child(content_, 0);
+        history_bytes -= text_bytes(oldest);
+        chat_message_label_ = nullptr;
+        lv_obj_del(oldest);
     }
 
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    const bool is_user = strcmp(role, "user") == 0;
+    lv_obj_t* message_parent = content_;
+    if (is_user) {
+        // Retain the right-aligned layout for conversations started with the button.
+        message_parent = lv_obj_create(content_);
+        lv_obj_set_width(message_parent, lv_pct(100));
+        lv_obj_set_height(message_parent, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(message_parent, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(message_parent, 0, 0);
+        lv_obj_set_style_pad_all(message_parent, 0, 0);
+        lv_obj_set_scrollbar_mode(message_parent, LV_SCROLLBAR_MODE_OFF);
+    }
 
-    // Create a message bubble
-    lv_obj_t* msg_bubble = lv_obj_create(content_);
+    auto msg_bubble = lv_obj_create(message_parent);
+    lv_obj_set_width(msg_bubble, lv_pct(is_user ? 85 : 100));
+    lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
     lv_obj_set_style_radius(msg_bubble, 8, 0);
     lv_obj_set_scrollbar_mode(msg_bubble, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_border_width(msg_bubble, 0, 0);
     lv_obj_set_style_pad_all(msg_bubble, lvgl_theme->spacing(4), 0);
-
-    // Create the message text
-    lv_obj_t* msg_text = lv_label_create(msg_bubble);
-    lv_label_set_text(msg_text, content);
-
-    // Calculate bubble width constraints
-    lv_coord_t max_width = LV_HOR_RES * 85 / 100 - 16;  // 85% of screen width
-    lv_coord_t min_width = 20;
-
-    // Let LVGL calculate the natural text width first
-    lv_obj_set_width(msg_text, LV_SIZE_CONTENT);
-    lv_obj_update_layout(msg_text);
-    lv_coord_t text_width = lv_obj_get_width(msg_text);
-
-    // Ensure text width is not less than minimum width
-    if (text_width < min_width) {
-        text_width = min_width;
+    lv_obj_set_style_bg_color(
+        msg_bubble,
+        is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->assistant_bubble_color(), 0);
+    lv_obj_set_style_bg_opa(msg_bubble, LV_OPA_70, 0);
+    lv_obj_set_user_data(msg_bubble, (void*)(is_user ? "user" : "assistant"));
+    if (is_user) {
+        lv_obj_align(msg_bubble, LV_ALIGN_RIGHT_MID, 0, 0);
     }
 
-    // Constrain to max width
-    lv_coord_t bubble_width = (text_width < max_width) ? text_width : max_width;
-
-    // Set message text width
-    lv_obj_set_width(msg_text, bubble_width);
+    auto msg_text = lv_label_create(msg_bubble);
+    lv_obj_set_width(msg_text, lv_pct(100));
     lv_label_set_long_mode(msg_text, LV_LABEL_LONG_WRAP);
-
-    // Set bubble width
-    lv_obj_set_width(msg_bubble, bubble_width);
-    lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
-
-    // Set alignment and style based on message role
-    if (strcmp(role, "user") == 0) {
-        // User messages are right-aligned with green background
-        lv_obj_set_style_bg_color(msg_bubble, lvgl_theme->user_bubble_color(), 0);
-        lv_obj_set_style_bg_opa(msg_bubble, LV_OPA_70, 0);
-        // Set text color for contrast
-        lv_obj_set_style_text_color(msg_text, lvgl_theme->text_color(), 0);
-
-        // Set custom attribute to mark bubble type
-        lv_obj_set_user_data(msg_bubble, (void*)"user");
-
-        // Set appropriate width for content
-        lv_obj_set_width(msg_bubble, LV_SIZE_CONTENT);
-        lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
-
-        // Don't grow
-        lv_obj_set_style_flex_grow(msg_bubble, 0, 0);
-    } else if (strcmp(role, "assistant") == 0) {
-        // Assistant messages are left-aligned with white background
-        lv_obj_set_style_bg_color(msg_bubble, lvgl_theme->assistant_bubble_color(), 0);
-        lv_obj_set_style_bg_opa(msg_bubble, LV_OPA_70, 0);
-        // Set text color for contrast
-        lv_obj_set_style_text_color(msg_text, lvgl_theme->text_color(), 0);
-
-        // Set custom attribute to mark bubble type
-        lv_obj_set_user_data(msg_bubble, (void*)"assistant");
-
-        // Set appropriate width for content
-        lv_obj_set_width(msg_bubble, LV_SIZE_CONTENT);
-        lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
-
-        // Don't grow
-        lv_obj_set_style_flex_grow(msg_bubble, 0, 0);
-    } else if (strcmp(role, "system") == 0) {
-        // System messages are center-aligned with light gray background
-        lv_obj_set_style_bg_color(msg_bubble, lvgl_theme->system_bubble_color(), 0);
-        lv_obj_set_style_bg_opa(msg_bubble, LV_OPA_70, 0);
-        // Set text color for contrast
-        lv_obj_set_style_text_color(msg_text, lvgl_theme->system_text_color(), 0);
-
-        // Set custom attribute to mark bubble type
-        lv_obj_set_user_data(msg_bubble, (void*)"system");
-
-        // Set appropriate width for content
-        lv_obj_set_width(msg_bubble, LV_SIZE_CONTENT);
-        lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
-
-        // Don't grow
-        lv_obj_set_style_flex_grow(msg_bubble, 0, 0);
-    }
-
-    // Create a full-width container for user messages to ensure right alignment
-    if (strcmp(role, "user") == 0) {
-        // Create a full-width container
-        lv_obj_t* container = lv_obj_create(content_);
-        lv_obj_set_width(container, LV_HOR_RES);
-        lv_obj_set_height(container, LV_SIZE_CONTENT);
-
-        // Make container transparent and borderless
-        lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(container, 0, 0);
-        lv_obj_set_style_pad_all(container, 0, 0);
-
-        // Move the message bubble into this container
-        lv_obj_set_parent(msg_bubble, container);
-
-        // Right align the bubble in the container
-        lv_obj_align(msg_bubble, LV_ALIGN_RIGHT_MID, -25, 0);
-
-        // Auto-scroll to this container
-        lv_obj_scroll_to_view_recursive(container, LV_ANIM_ON);
-    } else if (strcmp(role, "system") == 0) {
-        // Create full-width container for system messages to ensure center alignment
-        lv_obj_t* container = lv_obj_create(content_);
-        lv_obj_set_width(container, LV_HOR_RES);
-        lv_obj_set_height(container, LV_SIZE_CONTENT);
-
-        lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(container, 0, 0);
-        lv_obj_set_style_pad_all(container, 0, 0);
-
-        lv_obj_set_parent(msg_bubble, container);
-        lv_obj_align(msg_bubble, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_scroll_to_view_recursive(container, LV_ANIM_ON);
-    } else {
-        // For assistant messages
-        // Left align assistant messages
-        lv_obj_align(msg_bubble, LV_ALIGN_LEFT_MID, 0, 0);
-
-        // Auto-scroll to the message bubble
-        lv_obj_scroll_to_view_recursive(msg_bubble, LV_ANIM_ON);
-    }
-
-    // Store reference to the latest message label
+    lv_obj_set_style_text_align(msg_text, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(msg_text, lvgl_theme->text_color(), 0);
+    lv_label_set_text(msg_text, record_text);
     chat_message_label_ = msg_text;
+
+    // Explicitly scroll to the bottom, including when one record exceeds the viewport height.
+    lv_obj_update_layout(content_);
+    const int32_t max_scroll_y =
+        std::max<int32_t>(0, lv_obj_get_scroll_y(content_) + lv_obj_get_scroll_bottom(content_));
+    lv_obj_scroll_to_y(content_, max_scroll_y, LV_ANIM_OFF);
+    ESP_LOGI(TAG, "Chat history: role=%s messages=%lu bytes=%lu scroll_y=%ld max_scroll_y=%ld",
+             role, static_cast<unsigned long>(lv_obj_get_child_cnt(content_)),
+             static_cast<unsigned long>(history_bytes + record_bytes),
+             static_cast<long>(lv_obj_get_scroll_y(content_)), static_cast<long>(max_scroll_y));
 }
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
@@ -811,9 +718,9 @@ void LcdDisplay::ClearChatMessages() {
     // Reset chat_message_label_ as it has been deleted
     chat_message_label_ = nullptr;
 
-    // Show the centered AI logo (emoji_label_) again
+    // Clearing history leaves an empty announcement area.
     if (emoji_label_ != nullptr) {
-        lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 
     ESP_LOGI(TAG, "Chat messages cleared");
@@ -1102,6 +1009,20 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
+#if CONFIG_USE_WECHAT_MESSAGE_STYLE
+    DisplayLockGuard lock(this);
+    if (gif_controller_) {
+        gif_controller_->Stop();
+        gif_controller_.reset();
+    }
+    if (emoji_image_ != nullptr) {
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (emoji_label_ != nullptr) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    return;
+#else
     if (emoji_image_ == nullptr) {
         if (setup_ui_called_) {
             ESP_LOGW(TAG,
@@ -1169,19 +1090,6 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
     }
 
-#if CONFIG_USE_WECHAT_MESSAGE_STYLE
-    // In WeChat message style, if emotion is neutral, don't display it
-    uint32_t child_count = lv_obj_get_child_cnt(content_);
-    if (strcmp(emotion, "neutral") == 0 && child_count > 0) {
-        // Stop GIF animation if running
-        if (gif_controller_) {
-            gif_controller_->Stop();
-            gif_controller_.reset();
-        }
-
-        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-    }
 #endif
 }
 

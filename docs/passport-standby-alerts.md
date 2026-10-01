@@ -12,4 +12,12 @@ python scripts/build.py folo/ai-passport-c3 --name folo-ai-passport-c3 --languag
 
 Disable wake words for an alarm-only installation so speaker playback cannot wake a new conversation. The button still starts an intentional conversation. Preserve the current device's NVS when installing the resulting firmware, including Wi-Fi credentials, server endpoint and volume settings; never commit those contents.
 
+## Announcement screen
+
+The Passport board profile uses the existing multi-message layout. Announcements use the main screen area, wrap across lines, and remain after playback finishes. Once the content exceeds the screen height, the viewport scrolls upward to show the newest text. Emoji overlays are hidden; network, status and battery indicators remain at the top.
+
+The display retains up to 20 messages and 8 KiB of text in memory, removing the oldest entries when either limit is reached. A single message larger than the text budget retains its latest complete UTF-8 characters. History resets when the device reboots. Empty messages and temporary system notifications do not erase announcement history. On boards without PSRAM, the history layout retains server-provided dynamic glyphs across messages within a 64-glyph / 8 KiB bitmap cache; rare glyphs may be evicted when that budget is full.
+
+Screen acceptance must use the real device: send two distinct numbered announcements in the same capture window, include a message longer than the viewport, and check retained text, wrapping, upward scrolling and absence of emoji after returning to idle. Serial events can verify message delivery and layout state, but visual acceptance requires an actual screen image; a reconstructed mock UI is not a substitute.
+
 Real-device acceptance requires: a registered MAC in the gateway; a pushed alarm with received/queued frame counts matching and dropped=0; `Passive TTS playback drained` followed by Idle; no automatic listening after the alarm; continued registration after more than two minutes idle; a real connection interruption followed by reconnection and a successful second alarm. Keep firmware SHA-256, build logs and serial logs together as a repeatable verification artifact.
