@@ -12,17 +12,28 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <button_adc.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #define TAG "FoloAiPassportC3"
 
 namespace {
+
+constexpr uint8_t kBatteryVersionRegister = 0x00;
+constexpr uint8_t kBatteryVoltageRegister = 0x02;
+constexpr uint8_t kBatterySocRegister = 0x04;
+constexpr uint8_t kBatteryConfigRegister = 0x08;
+constexpr uint8_t kBatterySocAlertRegister = 0x0B;
+constexpr uint8_t kBatteryProfileUpdated = 0x80;
+constexpr int64_t kBatterySampleIntervalUs = 10 * 1000000;
+constexpr int64_t kBatteryLogIntervalUs = 30 * 1000000;
 
 enum AdcButtonIndex {
     kVolumeUpButton,
@@ -69,6 +80,87 @@ private:
     adc_oneshot_unit_handle_t button_adc_handle_ = nullptr;
     AdcButton* adc_buttons_[kAdcButtonCount] = {};
     LcdDisplay* display_ = nullptr;
+    i2c_master_dev_handle_t battery_device_ = nullptr;
+    std::mutex battery_mutex_;
+    int64_t last_battery_sample_us_ = -kBatterySampleIntervalUs;
+    int64_t last_battery_log_us_ = -kBatteryLogIntervalUs;
+    int battery_level_ = -1;
+    int last_logged_battery_level_ = -1;
+    const char* last_battery_error_ = nullptr;
+
+    void UpdateBattery() {
+        const int64_t now = esp_timer_get_time();
+        if (now - last_battery_sample_us_ < kBatterySampleIntervalUs) {
+            return;
+        }
+        last_battery_sample_us_ = now;
+        // An unsuccessful fresh read must never keep displaying an old percentage.
+        battery_level_ = -1;
+        int version = -1, config = -1, alert = -1, soc = -1, millivolts = -1;
+        const char* error = "none";
+        esp_err_t result = ESP_OK;
+        if (battery_device_ == nullptr) {
+            i2c_device_config_t device_config = {};
+            device_config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+            device_config.device_address = BATTERY_CW2017_ADDR;
+            device_config.scl_speed_hz = 100000;
+            result = i2c_master_bus_add_device(codec_i2c_bus_, &device_config, &battery_device_);
+        }
+        // Only register-address transactions are sent: no mode/profile/reset writes.
+        auto read = [this, &result](uint8_t reg, uint8_t* data, size_t length) {
+            result = i2c_master_transmit_receive(battery_device_, &reg, 1, data, length, 100);
+            return result == ESP_OK;
+        };
+        uint8_t data[2] = {};
+        if (result != ESP_OK) {
+            error = "device-add-failed";
+        } else if (!read(kBatteryVersionRegister, data, 1)) {
+            error = "version-read-failed";
+        } else {
+            version = data[0];
+            if (!read(kBatteryConfigRegister, data, 1)) {
+                error = "config-read-failed";
+            } else {
+                config = data[0];
+                if (!read(kBatterySocAlertRegister, data, 1)) {
+                    error = "profile-flag-read-failed";
+                } else {
+                    alert = data[0];
+                    if (!read(kBatterySocRegister, data, 2)) {
+                        error = "soc-read-failed";
+                    } else {
+                        soc = data[0];
+                        if (!read(kBatteryVoltageRegister, data, 2)) {
+                            error = "voltage-read-failed";
+                        } else {
+                            const uint32_t raw = ((uint32_t(data[0]) << 8) | data[1]) & 0x3FFF;
+                            millivolts = static_cast<int>((raw * 3125) / 10000);
+                            if (config != 0x00) {
+                                error = "gauge-not-active";
+                            } else if ((alert & kBatteryProfileUpdated) == 0) {
+                                error = "profile-not-configured";
+                            } else if (soc > 100) {
+                                error = "soc-not-ready";
+                            } else {
+                                battery_level_ = soc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (last_battery_error_ != error || last_logged_battery_level_ != battery_level_ ||
+            now - last_battery_log_us_ >= kBatteryLogIntervalUs) {
+            ESP_LOGI(TAG,
+                     "CW2017 sample: valid=%d soc=%d mv=%d version=%d config=%d alert=%d "
+                     "error=%s i2c=%s readonly=1 charge=unknown",
+                     battery_level_ >= 0, soc, millivolts, version, config, alert, error,
+                     esp_err_to_name(result));
+            last_battery_error_ = error;
+            last_logged_battery_level_ = battery_level_;
+            last_battery_log_us_ = now;
+        }
+    }
 
     void InitializeI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -198,6 +290,12 @@ private:
     }
 
 public:
+    ~FoloAiPassportC3Board() override {
+        if (battery_device_ != nullptr) {
+            i2c_master_bus_rm_device(battery_device_);
+        }
+    }
+
     FoloAiPassportC3Board() {
         InitializeI2c();
         InitializeSpi();
@@ -215,6 +313,19 @@ public:
     }
 
     Display* GetDisplay() override { return display_; }
+
+    bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        std::lock_guard<std::mutex> lock(battery_mutex_);
+        charging = false;
+        discharging = false;  // Passport exposes no charge-state GPIO/API.
+        level = -1;
+        UpdateBattery();
+        if (battery_level_ < 0) {
+            return false;
+        }
+        level = battery_level_;
+        return true;
+    }
 
     Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);

@@ -21,6 +21,8 @@ protected:
     lv_obj_t* status_bar_ = nullptr;
 #if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
     lv_obj_t* runtime_status_label_ = nullptr;
+    lv_obj_t* battery_percent_label_ = nullptr;
+    int last_battery_display_level_ = -2;
     int last_runtime_state_ = -1;
     bool last_network_connected_ = false;
     bool last_service_connected_ = false;
