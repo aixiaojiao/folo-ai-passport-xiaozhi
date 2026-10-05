@@ -297,6 +297,9 @@ LcdDisplay::~LcdDisplay() {
     if (runtime_status_label_ != nullptr) {
         lv_obj_del(runtime_status_label_);
     }
+    if (battery_percent_label_ != nullptr) {
+        lv_obj_del(battery_percent_label_);
+    }
 #endif
 
     // Clean up GIF controller
@@ -434,6 +437,13 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(battery_label_, icon_font, 0);
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(2), 0);
+
+#if CONFIG_BOARD_TYPE_FOLO_AI_PASSPORT_C3
+    battery_percent_label_ = lv_label_create(right_icons);
+    // Inherit the text font/color rather than the battery icon font.
+    lv_label_set_text(battery_percent_label_, "--%");
+    lv_obj_set_style_margin_left(battery_percent_label_, lvgl_theme->spacing(2), 0);
+#endif
 
     /* Layer 2: Status bar - for center text labels */
     status_bar_ = lv_obj_create(screen);
@@ -1066,12 +1076,51 @@ void LcdDisplay::UpdateStatusBar(bool update_all) {
     char text[160];
     snprintf(text, sizeof(text), "%s\n%s %s%s", connection, wifi, runtime_caption, uptime);
 
+    int battery_level = -1;
+    bool charging = false, discharging = false;
+    const bool battery_valid =
+        Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging);
+    char battery_text[8];
+    if (battery_valid) {
+        snprintf(battery_text, sizeof(battery_text), "%d%%", battery_level);
+    } else {
+        snprintf(battery_text, sizeof(battery_text), "--%%");
+    }
+
     DisplayLockGuard lock(this);
     lv_label_set_text(runtime_status_label_, text);
+    if (battery_percent_label_ != nullptr) {
+        lv_label_set_text(battery_percent_label_, battery_text);
+        // Hide a stale icon when the gauge becomes unavailable. The base refresh restores it.
+        if (!battery_valid) {
+            lv_label_set_text(battery_label_, "");
+            battery_icon_ = nullptr;
+        }
+        lv_obj_update_layout(top_bar_);
+        lv_area_t network_area, right_area, screen_area;
+        lv_obj_get_coords(network_label_, &network_area);
+        lv_obj_get_coords(lv_obj_get_parent(battery_percent_label_), &right_area);
+        lv_obj_get_coords(lv_screen_active(), &screen_area);
+        const int32_t gap = static_cast<LvglTheme*>(current_theme_)->spacing(4);
+        const int32_t left = network_area.x2 + 1 + gap;
+        const int32_t available = std::max<int32_t>(0, right_area.x1 - gap - left);
+        // Constrain the old absolute overlay to the actual free space between the icons.
+        lv_obj_set_width(status_bar_, std::max<int32_t>(1, available));
+        lv_obj_align(status_bar_, LV_ALIGN_TOP_LEFT, left - screen_area.x1, 0);
+        lv_obj_set_width(status_label_, lv_pct(100));
+        lv_obj_set_width(notification_label_, lv_pct(100));
+        lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        if (available == 0) {
+            lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     const int64_t log_slot = uptime_seconds / 10;
     if (last_runtime_state_ != static_cast<int>(state) ||
         last_network_connected_ != network_connected ||
-        last_service_connected_ != service_connected || last_runtime_log_slot_ != log_slot) {
+        last_service_connected_ != service_connected || last_runtime_log_slot_ != log_slot ||
+        last_battery_display_level_ != battery_level) {
         lv_obj_update_layout(runtime_status_label_);
         lv_area_t area;
         lv_obj_get_coords(runtime_status_label_, &area);
@@ -1079,10 +1128,25 @@ void LcdDisplay::UpdateStatusBar(bool update_all) {
                  runtime_caption, uptime, static_cast<long>(area.x1), static_cast<long>(area.y1),
                  static_cast<long>(lv_obj_get_width(runtime_status_label_)),
                  static_cast<long>(lv_obj_get_height(runtime_status_label_)));
+        if (battery_percent_label_ != nullptr) {
+            lv_area_t battery_area, center_area;
+            lv_obj_get_coords(battery_percent_label_, &battery_area);
+            lv_obj_get_coords(status_bar_, &center_area);
+            ESP_LOGI(TAG,
+                     "Battery display: text=%s valid=%d x=%ld y=%ld w=%ld h=%ld "
+                     "center_x=%ld center_w=%ld",
+                     battery_text, battery_valid, static_cast<long>(battery_area.x1),
+                     static_cast<long>(battery_area.y1),
+                     static_cast<long>(lv_obj_get_width(battery_percent_label_)),
+                     static_cast<long>(lv_obj_get_height(battery_percent_label_)),
+                     static_cast<long>(center_area.x1),
+                     static_cast<long>(lv_obj_get_width(status_bar_)));
+        }
         last_runtime_state_ = static_cast<int>(state);
         last_network_connected_ = network_connected;
         last_service_connected_ = service_connected;
         last_runtime_log_slot_ = log_slot;
+        last_battery_display_level_ = battery_level;
     }
 }
 #endif

@@ -18,6 +18,16 @@ The Passport turns off its backlight after 30 seconds idle with audio playback d
 
 Turning the backlight off does not stop the CPU, Wi-Fi or standby WebSocket, and does not clear announcement history. The temporary zero brightness is not saved to NVS. Real-device acceptance must observe the backlight switching off, a new announcement waking it, and another shutdown after playback; serial backlight commands support the check but do not alone prove the physical screen state or battery runtime.
 
+## Battery level
+
+The Passport reads the CW2017 fuel gauge on the existing shared I2C0 bus (SDA GPIO10, SCL GPIO7, 7-bit address `0x63`). These assignments and the SOC register format follow FoloToy's [official hardware guide](https://github.com/FoloToy/ai-passport/blob/main/docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.md) and [battery driver](https://github.com/FoloToy/ai-passport/blob/main/components/bsp/src/bsp_battery.c). The [product specification](https://github.com/FoloToy/ai-passport/blob/main/docs/hardware-design/specifications.md) identifies a built-in 520 mAh rechargeable lithium battery; GPIO0 is the button ladder, not a battery ADC input.
+
+This integration only reads an already active gauge with its profile update flag set and a valid SOC. It preserves the current profile and learned state: it does not write a profile, reset the gauge, change its mode, or derive a percentage from voltage. The integer SOC must be within 0–100. A valid reading describes the gauge's estimate; it does not establish battery-profile calibration or measured runtime.
+
+The top bar shows a numeric percentage beside the existing battery icon. Reads are cached for ten seconds; initialization, unavailable hardware, an inactive or unconfigured gauge, invalid SOC, and I2C errors show `--%` instead of an invented or stale percentage. The board has no verified charging-state interface, so USB connectivity or changing SOC must not be presented as proof of charging or discharging. This feature does not issue charging notifications or infer low-battery audio warnings from an unknown discharge state.
+
+Battery refresh does not wake the backlight or restart the idle timer. Standby WebSocket delivery, announcement playback and history, the fixed status band, buttons, saved brightness, and NVS preservation retain their existing behavior. Acceptance must separately record real gauge responses, displayed values and failure handling; building successfully does not prove SOC accuracy or charging detection.
+
 ## Announcement screen
 
 The Passport board profile uses the existing multi-message layout. Announcements use the main screen area, wrap across lines, and remain after playback finishes. Once the content exceeds the screen height, the viewport scrolls upward to show the newest text. Emoji overlays are hidden; network, status and battery indicators remain at the top.
