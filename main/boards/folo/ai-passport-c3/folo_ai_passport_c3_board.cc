@@ -190,8 +190,20 @@ private:
                 break;
             }
             uint8_t soc = 0;
-            if (ReadBattery(kBatterySocRegister, &soc, 1, timeout_ms) == ESP_OK && soc <= 100) {
-                ESP_LOGI(TAG, "CW2017 init complete: soc=%u", soc);
+            if (ReadBattery(kBatterySocRegister, &soc, 1, timeout_ms) != ESP_OK || soc > 100) {
+                continue;
+            }
+            const int voltage_timeout_ms =
+                static_cast<int>(std::min<int64_t>(100, (deadline - esp_timer_get_time()) / 1000));
+            if (voltage_timeout_ms <= 0) {
+                break;
+            }
+            uint8_t voltage[2] = {};
+            if (ReadBattery(kBatteryVoltageRegister, voltage, 2, voltage_timeout_ms) == ESP_OK &&
+                (((uint32_t(voltage[0]) << 8) | voltage[1]) & 0x3FFF) != 0) {
+                ESP_LOGI(
+                    TAG, "CW2017 init complete: soc=%u voltage_raw=%u", soc,
+                    static_cast<unsigned>(((uint32_t(voltage[0]) << 8) | voltage[1]) & 0x3FFF));
                 return nullptr;
             }
         }
@@ -271,6 +283,8 @@ private:
                                 error = "profile-not-configured";
                             } else if (soc > 100) {
                                 error = "soc-not-ready";
+                            } else if (raw == 0) {
+                                error = "voltage-not-ready";
                             } else {
                                 battery_level_ = soc;
                             }
