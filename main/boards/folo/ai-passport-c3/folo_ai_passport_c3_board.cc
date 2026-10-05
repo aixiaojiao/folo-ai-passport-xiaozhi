@@ -31,7 +31,21 @@ constexpr uint8_t kBatteryVoltageRegister = 0x02;
 constexpr uint8_t kBatterySocRegister = 0x04;
 constexpr uint8_t kBatteryConfigRegister = 0x08;
 constexpr uint8_t kBatterySocAlertRegister = 0x0B;
+constexpr uint8_t kBatteryProfileRegister = 0x10;
 constexpr uint8_t kBatteryProfileUpdated = 0x80;
+constexpr uint8_t kBatteryActive = 0x00;
+constexpr uint8_t kBatteryRestart = 0x30;
+constexpr uint8_t kBatterySleep = 0xF0;
+// Exact UTL 520 mAh profile supplied by FoloToy's official Passport BSP:
+// https://github.com/FoloToy/ai-passport/blob/main/components/bsp/src/bsp_battery.c
+constexpr uint8_t kBatteryProfile[] = {
+    0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAD, 0xC7, 0xC8, 0xCA, 0xBD, 0xB1, 0xC1, 0x94,
+    0x88, 0xD1, 0xBD, 0x97, 0x88, 0x66, 0x56, 0x4A, 0x3F, 0x33, 0x26, 0x5C, 0x37, 0xD1, 0x27, 0xD8,
+    0xCC, 0xB7, 0xCF, 0xB3, 0xB2, 0xAE, 0xA6, 0x9E, 0x99, 0x97, 0x9B, 0x86, 0x47, 0x1E, 0x17, 0x26,
+    0x49, 0x96, 0xD9, 0xE1, 0xDD, 0xDC, 0xD4, 0x59, 0x00, 0x00, 0x90, 0x02, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5C,
+};
+static_assert(sizeof(kBatteryProfile) == 80);
 constexpr int64_t kBatterySampleIntervalUs = 10 * 1000000;
 constexpr int64_t kBatteryLogIntervalUs = 30 * 1000000;
 
@@ -88,7 +102,103 @@ private:
     int last_logged_battery_level_ = -1;
     const char* last_battery_error_ = nullptr;
 
-    void UpdateBattery() {
+    esp_err_t ReadBattery(uint8_t reg, uint8_t* data, size_t length, int timeout_ms = 100) {
+        return i2c_master_transmit_receive(battery_device_, &reg, 1, data, length, timeout_ms);
+    }
+
+    esp_err_t WriteBattery(uint8_t reg, uint8_t value) {
+        const uint8_t data[] = {reg, value};
+        return i2c_master_transmit(battery_device_, data, sizeof(data), 100);
+    }
+
+    bool SetBatteryMode(uint8_t mode) {
+        if (WriteBattery(kBatteryConfigRegister, kBatteryRestart) != ESP_OK) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (WriteBattery(kBatteryConfigRegister, mode) != ESP_OK) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        uint8_t actual = 0;
+        const esp_err_t result = ReadBattery(kBatteryConfigRegister, &actual, 1);
+        ESP_LOGI(TAG, "CW2017 mode: target=0x%02x actual=0x%02x i2c=%s", mode, actual,
+                 esp_err_to_name(result));
+        return result == ESP_OK && actual == mode;
+    }
+
+    const char* InitializeBattery(uint8_t version, uint8_t config, uint8_t alert) {
+        // Only initialize the hardware version already observed on the connected device.
+        if (version != BATTERY_CW2017_OBSERVED_VERSION) {
+            return "unverified-version";
+        }
+        if (config != kBatteryActive && config != kBatterySleep && config != kBatteryRestart) {
+            return "unknown-gauge-mode";
+        }
+        ESP_LOGI(TAG, "CW2017 init: version=0x%02x config=0x%02x alert=0x%02x profile_write=%d",
+                 version, config, alert, (alert & kBatteryProfileUpdated) == 0);
+        if ((alert & kBatteryProfileUpdated) == 0) {
+            if (!SetBatteryMode(kBatterySleep)) {
+                return "init-sleep-failed";
+            }
+            for (size_t index = 0; index < sizeof(kBatteryProfile); ++index) {
+                const esp_err_t result =
+                    WriteBattery(kBatteryProfileRegister + index, kBatteryProfile[index]);
+                if (result != ESP_OK) {
+                    ESP_LOGE(TAG, "CW2017 profile write failed: index=%u i2c=%s",
+                             static_cast<unsigned>(index), esp_err_to_name(result));
+                    return "profile-write-failed";
+                }
+            }
+            for (size_t index = 0; index < sizeof(kBatteryProfile); ++index) {
+                uint8_t actual = 0;
+                const esp_err_t result = ReadBattery(kBatteryProfileRegister + index, &actual, 1);
+                if (result != ESP_OK || actual != kBatteryProfile[index]) {
+                    ESP_LOGE(TAG,
+                             "CW2017 profile verify failed: index=%u expected=0x%02x "
+                             "actual=0x%02x i2c=%s",
+                             static_cast<unsigned>(index), kBatteryProfile[index], actual,
+                             esp_err_to_name(result));
+                    return "profile-verify-failed";
+                }
+            }
+            ESP_LOGI(TAG, "CW2017 profile verified: bytes=80 capacity_mah=520");
+            if (ReadBattery(kBatterySocAlertRegister, &alert, 1) != ESP_OK ||
+                WriteBattery(kBatterySocAlertRegister, alert | kBatteryProfileUpdated) != ESP_OK) {
+                return "profile-flag-write-failed";
+            }
+            uint8_t actual = 0;
+            if (ReadBattery(kBatterySocAlertRegister, &actual, 1) != ESP_OK ||
+                actual != (alert | kBatteryProfileUpdated)) {
+                return "profile-flag-verify-failed";
+            }
+        }
+        if (!SetBatteryMode(kBatteryActive)) {
+            return "init-active-failed";
+        }
+        const int64_t deadline = esp_timer_get_time() + 5 * 1000000;
+        while (esp_timer_get_time() < deadline) {
+            const int delay_ms =
+                static_cast<int>(std::min<int64_t>(100, (deadline - esp_timer_get_time()) / 1000));
+            if (delay_ms <= 0) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            const int timeout_ms =
+                static_cast<int>(std::min<int64_t>(100, (deadline - esp_timer_get_time()) / 1000));
+            if (timeout_ms <= 0) {
+                break;
+            }
+            uint8_t soc = 0;
+            if (ReadBattery(kBatterySocRegister, &soc, 1, timeout_ms) == ESP_OK && soc <= 100) {
+                ESP_LOGI(TAG, "CW2017 init complete: soc=%u", soc);
+                return nullptr;
+            }
+        }
+        return "soc-settling-timeout";
+    }
+
+    void UpdateBattery(bool initialize = false) {
         const int64_t now = esp_timer_get_time();
         if (now - last_battery_sample_us_ < kBatterySampleIntervalUs) {
             return;
@@ -106,9 +216,8 @@ private:
             device_config.scl_speed_hz = 100000;
             result = i2c_master_bus_add_device(codec_i2c_bus_, &device_config, &battery_device_);
         }
-        // Only register-address transactions are sent: no mode/profile/reset writes.
         auto read = [this, &result](uint8_t reg, uint8_t* data, size_t length) {
-            result = i2c_master_transmit_receive(battery_device_, &reg, 1, data, length, 100);
+            result = ReadBattery(reg, data, length);
             return result == ESP_OK;
         };
         uint8_t data[2] = {};
@@ -126,6 +235,27 @@ private:
                     error = "profile-flag-read-failed";
                 } else {
                     alert = data[0];
+                    if (initialize && (config == kBatterySleep || config == kBatteryRestart ||
+                                       (alert & kBatteryProfileUpdated) == 0)) {
+                        const char* init_error = InitializeBattery(version, config, alert);
+                        if (init_error != nullptr) {
+                            ESP_LOGW(TAG, "CW2017 init failed: error=%s; no runtime init retries",
+                                     init_error);
+                            error = init_error;
+                            goto sample_done;
+                        }
+                        // Publish only fresh post-initialization register values.
+                        if (!read(kBatteryConfigRegister, data, 1)) {
+                            error = "config-read-failed";
+                            goto sample_done;
+                        }
+                        config = data[0];
+                        if (!read(kBatterySocAlertRegister, data, 1)) {
+                            error = "profile-flag-read-failed";
+                            goto sample_done;
+                        }
+                        alert = data[0];
+                    }
                     if (!read(kBatterySocRegister, data, 2)) {
                         error = "soc-read-failed";
                     } else {
@@ -135,7 +265,7 @@ private:
                         } else {
                             const uint32_t raw = ((uint32_t(data[0]) << 8) | data[1]) & 0x3FFF;
                             millivolts = static_cast<int>((raw * 3125) / 10000);
-                            if (config != 0x00) {
+                            if (config != kBatteryActive) {
                                 error = "gauge-not-active";
                             } else if ((alert & kBatteryProfileUpdated) == 0) {
                                 error = "profile-not-configured";
@@ -149,13 +279,14 @@ private:
                 }
             }
         }
+    sample_done:
         if (last_battery_error_ != error || last_logged_battery_level_ != battery_level_ ||
             now - last_battery_log_us_ >= kBatteryLogIntervalUs) {
             ESP_LOGI(TAG,
                      "CW2017 sample: valid=%d soc=%d mv=%d version=%d config=%d alert=%d "
-                     "error=%s i2c=%s readonly=1 charge=unknown",
+                     "error=%s i2c=%s boot_init_allowed=%d charge=unknown",
                      battery_level_ >= 0, soc, millivolts, version, config, alert, error,
-                     esp_err_to_name(result));
+                     esp_err_to_name(result), initialize);
             last_battery_error_ = error;
             last_logged_battery_level_ = battery_level_;
             last_battery_log_us_ = now;
@@ -298,6 +429,12 @@ public:
 
     FoloAiPassportC3Board() {
         InitializeI2c();
+        {
+            // One bounded cold-boot attempt, before display/audio/network activity.
+            // Normal getters remain read-only and can recover a settling SOC without resets.
+            std::lock_guard<std::mutex> lock(battery_mutex_);
+            UpdateBattery(true);
+        }
         InitializeSpi();
         InitializeDisplay();
         InitializeButtons();
