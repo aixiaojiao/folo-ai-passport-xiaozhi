@@ -21,6 +21,8 @@
 
 // CW2017 fuel gauge shares I2C0 with the ES8311 (official Passport BSP).
 #define BATTERY_CW2017_ADDR 0x63
+// VERSION read on this connected Passport on 2026-10-05; not a vendor chip-ID claim.
+#define BATTERY_CW2017_OBSERVED_VERSION 0xA0
 
 // Three keys share GPIO0 / ADC1 channel 0 through a resistor ladder.
 #define BUTTON_ADC_UNIT ADC_UNIT_1
