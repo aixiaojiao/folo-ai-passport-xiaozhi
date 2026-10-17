@@ -178,7 +178,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 }
 
 bool MqttProtocol::SendText(const std::string& text) {
-    if (publish_topic_.empty()) {
+    if (mqtt_ == nullptr || publish_topic_.empty()) {
         return false;
     }
     if (!mqtt_->Publish(publish_topic_, text)) {

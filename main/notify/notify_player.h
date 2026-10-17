@@ -19,6 +19,7 @@ struct NotifySubtitle {
 
 class NotifyPlayer {
 public:
+    using PlayingCallback = std::function<void(uint32_t playback_id)>;
     using SubtitleCallback = std::function<void(uint32_t playback_id, const std::string& text)>;
     using FinishedCallback = std::function<void(uint32_t playback_id, bool success)>;
 
@@ -26,10 +27,13 @@ public:
     ~NotifyPlayer();
 
     bool Start(std::string audio_url, std::vector<NotifySubtitle> subtitles, uint32_t playback_id,
+               int64_t deadline_us, PlayingCallback playing_callback,
                SubtitleCallback subtitle_callback, FinishedCallback finished_callback);
     void Stop();
     void OnPlaybackProgress(uint32_t playback_id, uint32_t media_position_ms);
     void OnPlaybackDrained();
+    bool CanPlay(uint32_t playback_id) const;
+    void OnPlaybackError(uint32_t playback_id);
     bool IsActive(uint32_t playback_id = 0) const;
     bool IsBusy() const;
 
@@ -39,10 +43,13 @@ private:
     std::string audio_url_;
     std::vector<NotifySubtitle> subtitles_;
     std::string displayed_text_;
+    PlayingCallback playing_callback_;
     SubtitleCallback subtitle_callback_;
     FinishedCallback finished_callback_;
     TaskHandle_t task_handle_ = nullptr;
     uint32_t playback_id_ = 0;
+    int64_t deadline_us_ = 0;
+    bool playback_started_ = false;
     uint32_t last_playback_position_ms_ = 0;
     uint32_t underrun_count_ = 0;
     size_t next_subtitle_index_ = 0;

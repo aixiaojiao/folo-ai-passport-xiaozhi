@@ -105,6 +105,25 @@ void Protocol::SendMcpMessage(const std::string& payload) {
     SendText(message);
 }
 
+bool Protocol::SendNotifyStatus(const std::string& id, const char* state, const char* reason) {
+    if (id.empty())
+        return false;  // Legacy notifications have no correlatable receipt.
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr)
+        return false;
+    bool valid = cJSON_AddStringToObject(root, "type", "notify_status") != nullptr &&
+                 cJSON_AddStringToObject(root, "id", id.c_str()) != nullptr &&
+                 cJSON_AddStringToObject(root, "state", state) != nullptr;
+    if (reason != nullptr && reason[0] != '\0') {
+        valid = valid && cJSON_AddStringToObject(root, "reason", reason) != nullptr;
+    }
+    char* encoded = valid ? cJSON_PrintUnformatted(root) : nullptr;
+    const bool sent = encoded != nullptr && SendText(encoded);
+    cJSON_free(encoded);
+    cJSON_Delete(root);
+    return sent;
+}
+
 bool Protocol::IsTimeout() const {
     const int kTimeoutSeconds = 120;
     auto now = std::chrono::steady_clock::now();

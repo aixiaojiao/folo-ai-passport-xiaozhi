@@ -6,6 +6,7 @@
 #include <memory>
 
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include "board.h"
 #include "http.h"
@@ -28,7 +29,8 @@ NotifyPlayer::NotifyPlayer(AudioService& audio_service) : audio_service_(audio_s
 NotifyPlayer::~NotifyPlayer() { Stop(); }
 
 bool NotifyPlayer::Start(std::string audio_url, std::vector<NotifySubtitle> subtitles,
-                         uint32_t playback_id, SubtitleCallback subtitle_callback,
+                         uint32_t playback_id, int64_t deadline_us,
+                         PlayingCallback playing_callback, SubtitleCallback subtitle_callback,
                          FinishedCallback finished_callback) {
     if (playback_id == 0 || !IsSupportedUrl(audio_url)) {
         return false;
@@ -47,6 +49,9 @@ bool NotifyPlayer::Start(std::string audio_url, std::vector<NotifySubtitle> subt
         audio_url_ = std::move(audio_url);
         subtitles_ = std::move(subtitles);
         displayed_text_.clear();
+        playing_callback_ = std::move(playing_callback);
+        playback_started_ = false;
+        deadline_us_ = deadline_us;
         subtitle_callback_ = std::move(subtitle_callback);
         finished_callback_ = std::move(finished_callback);
         playback_id_ = playback_id;
@@ -81,6 +86,7 @@ void NotifyPlayer::Stop() {
     cancelled_ = true;
     active_ = false;
     subtitles_.clear();
+    playing_callback_ = nullptr;
     subtitle_callback_ = nullptr;
     finished_callback_ = nullptr;
 }
@@ -97,17 +103,38 @@ bool NotifyPlayer::IsBusy() const {
 
 bool NotifyPlayer::IsCancelled(uint32_t playback_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return cancelled_ || !active_ || playback_id != playback_id_;
+    return cancelled_ || !active_ || playback_id != playback_id_ ||
+           (deadline_us_ != 0 && esp_timer_get_time() >= deadline_us_);
+}
+
+bool NotifyPlayer::CanPlay(uint32_t playback_id) const { return !IsCancelled(playback_id); }
+
+void NotifyPlayer::OnPlaybackError(uint32_t playback_id) {
+    FinishedCallback callback;
+    uint32_t failed_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!active_ || playback_id != playback_id_)
+            return;
+        callback = CompleteLocked(failed_id);
+    }
+    if (callback)
+        callback(failed_id, false);
 }
 
 void NotifyPlayer::OnPlaybackProgress(uint32_t playback_id, uint32_t media_position_ms) {
     SubtitleCallback callback;
+    PlayingCallback playing_callback;
     std::string text;
     bool subtitle_changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_ || playback_id != playback_id_) {
             return;
+        }
+        if (!playback_started_) {
+            playback_started_ = true;
+            playing_callback = playing_callback_;
         }
         last_playback_position_ms_ = media_position_ms;
         while (next_subtitle_index_ < subtitles_.size() &&
@@ -116,15 +143,15 @@ void NotifyPlayer::OnPlaybackProgress(uint32_t playback_id, uint32_t media_posit
             ++next_subtitle_index_;
             subtitle_changed = true;
         }
-        if (!subtitle_changed || text == displayed_text_) {
-            return;
+        if (subtitle_changed && text != displayed_text_) {
+            displayed_text_ = text;
+            callback = subtitle_callback_;
         }
-        displayed_text_ = text;
-        callback = subtitle_callback_;
     }
-    if (callback) {
+    if (playing_callback)
+        playing_callback(playback_id);
+    if (callback)
         callback(playback_id, text);
-    }
 }
 
 NotifyPlayer::FinishedCallback NotifyPlayer::CompleteLocked(uint32_t& playback_id) {
@@ -142,6 +169,7 @@ void NotifyPlayer::OnPlaybackDrained() {
     uint32_t playback_id = 0;
     uint32_t underrun_count = 0;
     uint32_t media_position_ms = 0;
+    bool report_success = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) {
@@ -149,6 +177,7 @@ void NotifyPlayer::OnPlaybackDrained() {
         }
         playback_drained_ = true;
         if (http_finished_) {
+            report_success = playback_started_;
             callback = CompleteLocked(playback_id);
         } else if (stream_started_) {
             underrun_count = ++underrun_count_;
@@ -161,7 +190,7 @@ void NotifyPlayer::OnPlaybackDrained() {
                  static_cast<unsigned long>(media_position_ms));
     }
     if (callback) {
-        callback(playback_id, true);
+        callback(playback_id, report_success);
     }
 }
 
@@ -278,7 +307,7 @@ void NotifyPlayer::WorkerTask() {
                 http_finished_ = true;
                 if (playback_drained_) {
                     callback = CompleteLocked(completed_playback_id);
-                    report_success = true;
+                    report_success = playback_started_;
                 }
             }
         }

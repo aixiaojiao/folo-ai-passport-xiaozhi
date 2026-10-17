@@ -344,11 +344,14 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
-        if (task.playback_id != 0 && callbacks_.on_playback_progress) {
-            callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
+        const bool allowed = task.playback_id == 0 || !callbacks_.allow_playback ||
+                             callbacks_.allow_playback(task.playback_id);
+        if (allowed) {
+            codec_->OutputData(task.pcm);
+            if (task.playback_id != 0 && callbacks_.on_playback_progress) {
+                callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
+            }
         }
-
-        codec_->OutputData(task.pcm);
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -440,7 +443,7 @@ void AudioService::OpusCodecTask() {
                         resampled.resize(actual_output);
                         task.pcm = std::move(resampled);
                     }
-                    decoded = true;
+                    decoded = !task.pcm.empty();
                 } else {
                     ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
                 }
@@ -448,6 +451,9 @@ void AudioService::OpusCodecTask() {
                 ESP_LOGE(TAG, "Audio decoder is not configured");
             }
 
+            if (!decoded && packet->playback_id != 0 && callbacks_.on_playback_error) {
+                callbacks_.on_playback_error(packet->playback_id);
+            }
             lock.lock();
             if (decoded && generation == playback_generation_ && !service_stopped_.load()) {
                 audio_playback_queue_.push_back(std::move(task));

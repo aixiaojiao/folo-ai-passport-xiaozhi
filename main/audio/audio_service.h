@@ -86,6 +86,10 @@ struct AudioServiceCallbacks {
     std::function<void(void)> on_audio_testing_queue_full;
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
+    // Notification-only gate before each PCM frame reaches the codec. No network I/O here.
+    std::function<bool(uint32_t playback_id)> allow_playback;
+    std::function<void(uint32_t playback_id)> on_playback_error;
+    // Fires after handing the PCM frame to the codec, not when downloading/enqueueing it.
     std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
 };
 
