@@ -15,6 +15,8 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <sys/time.h>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -87,6 +89,8 @@ void Application::Initialize() {
     callbacks.on_playback_drained = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
     };
+    callbacks.allow_playback = [this](uint32_t id) { return notify_player_.CanPlay(id); };
+    callbacks.on_playback_error = [this](uint32_t id) { notify_player_.OnPlaybackError(id); };
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
     };
@@ -188,7 +192,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_ERROR) {
             if (GetDeviceState() == kDeviceStateNotifying) {
-                StopNotification();
+                StopNotification("failed", "protocol_error");
             }
             SetDeviceState(kDeviceStateIdle);
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
@@ -271,6 +275,10 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
+            if (GetDeviceState() == kDeviceStateNotifying && notification_deadline_us_ != 0 &&
+                esp_timer_get_time() >= notification_deadline_us_) {
+                StopNotification("failed", "expired");
+            }
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
@@ -316,7 +324,7 @@ void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
-        StopNotification();
+        StopNotification("failed", "network_disconnected");
     }
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
@@ -552,6 +560,13 @@ void Application::InitializeProtocol() {
     }
 
     protocol_->OnConnected([this]() { DismissAlert(); });
+    protocol_->OnDisconnected([this]() {
+        Schedule([this]() {
+            if (GetDeviceState() == kDeviceStateNotifying) {
+                StopNotification("failed", "network_disconnected");
+            }
+        });
+    });
 
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
@@ -577,6 +592,9 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+            if (GetDeviceState() == kDeviceStateNotifying) {
+                StopNotification("failed", "network_disconnected");
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -591,37 +609,89 @@ void Application::InitializeProtocol() {
             return;
         }
         if (strcmp(type->valuestring, "notify") == 0) {
+            std::string id;
+            auto id_json = cJSON_GetObjectItem(root, "id");
+            if (id_json != nullptr) {
+                if (!cJSON_IsString(id_json) || !IsValidNotifyId(id_json->valuestring)) {
+                    ESP_LOGW(TAG, "Notify id must contain 1-64 safe ASCII characters");
+                    return;
+                }
+                id = id_json->valuestring;
+            }
+            auto reject = [this, &id](const char* reason) {
+                Schedule([this, id, reason]() {
+                    if (!id.empty() && id == notification_receipt_.id) {
+                        SendNotificationStatus(notification_receipt_);
+                    } else if (const auto* receipt = notification_receipts_.Find(id)) {
+                        SendNotificationStatus(*receipt);
+                    } else {
+                        SendNotificationStatus({id, "failed", reason});
+                    }
+                });
+            };
             auto audio_url = cJSON_GetObjectItem(root, "audio_url");
-            if (!cJSON_IsString(audio_url) || audio_url->valuestring[0] == '\0') {
-                ESP_LOGW(TAG, "Notify message requires audio_url");
+            if (!cJSON_IsString(audio_url) || audio_url->valuestring[0] == '\0' ||
+                strlen(audio_url->valuestring) > 2048) {
+                reject("invalid_audio_url");
                 return;
+            }
+
+            int64_t sent_at_ms = 0;
+            int64_t ttl_ms = 0;
+            auto sent_at = cJSON_GetObjectItem(root, "sent_at_ms");
+            auto ttl = cJSON_GetObjectItem(root, "ttl_ms");
+            if (sent_at != nullptr || ttl != nullptr) {
+                if (id.empty() || !cJSON_IsNumber(sent_at) || !cJSON_IsNumber(ttl) ||
+                    !std::isfinite(sent_at->valuedouble) || !std::isfinite(ttl->valuedouble) ||
+                    sent_at->valuedouble < 1704067200000.0 ||
+                    sent_at->valuedouble > 4102444800000.0 || ttl->valuedouble < 1 ||
+                    ttl->valuedouble > 600000 ||
+                    std::floor(sent_at->valuedouble) != sent_at->valuedouble ||
+                    std::floor(ttl->valuedouble) != ttl->valuedouble) {
+                    reject("invalid_expiry");
+                    return;
+                }
+                sent_at_ms = static_cast<int64_t>(sent_at->valuedouble);
+                ttl_ms = static_cast<int64_t>(ttl->valuedouble);
             }
 
             std::vector<NotifySubtitle> subtitles;
             auto subtitles_json = cJSON_GetObjectItem(root, "subtitles");
             if (subtitles_json != nullptr && !cJSON_IsArray(subtitles_json)) {
-                ESP_LOGW(TAG, "Notify subtitles must be an array");
+                reject("invalid_subtitles");
                 return;
             }
             if (cJSON_IsArray(subtitles_json)) {
+                if (cJSON_GetArraySize(subtitles_json) > 32) {
+                    reject("too_many_subtitles");
+                    return;
+                }
+                size_t text_bytes = 0;
                 cJSON* item = nullptr;
                 cJSON_ArrayForEach (item, subtitles_json) {
                     auto start_ms = cJSON_GetObjectItem(item, "start_ms");
                     auto text = cJSON_GetObjectItem(item, "text");
-                    if (!cJSON_IsNumber(start_ms) || start_ms->valuedouble < 0 ||
+                    if (!cJSON_IsNumber(start_ms) || !std::isfinite(start_ms->valuedouble) ||
+                        start_ms->valuedouble < 0 ||
                         start_ms->valuedouble > std::numeric_limits<uint32_t>::max() ||
                         !cJSON_IsString(text)) {
                         ESP_LOGW(TAG, "Ignoring invalid notify subtitle");
                         continue;
+                    }
+                    text_bytes += strlen(text->valuestring);
+                    if (text_bytes > 4096) {
+                        reject("subtitles_too_large");
+                        return;
                     }
                     subtitles.push_back({.start_ms = static_cast<uint32_t>(start_ms->valuedouble),
                                          .text = text->valuestring});
                 }
             }
 
-            Schedule([this, url = std::string(audio_url->valuestring),
-                      subtitles = std::move(subtitles)]() mutable {
-                StartNotification(std::move(url), std::move(subtitles));
+            Schedule([this, url = std::string(audio_url->valuestring), id = std::move(id),
+                      sent_at_ms, ttl_ms, subtitles = std::move(subtitles)]() mutable {
+                StartNotification(std::move(url), std::move(subtitles), std::move(id), sent_at_ms,
+                                  ttl_ms);
             });
         } else if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
@@ -1103,9 +1173,44 @@ void Application::ConfigureWakeWordForListening() {
 #endif
 }
 
-void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+void Application::SendNotificationStatus(const NotifyReceipt& receipt) {
+    if (receipt.id.empty())
+        return;
+    ESP_LOGI(TAG, "Notify %s: %s (%s)", receipt.id.c_str(), receipt.state, receipt.reason);
+    if (!protocol_ || !protocol_->SendNotifyStatus(receipt.id, receipt.state, receipt.reason)) {
+        ESP_LOGW(TAG, "Notify receipt not delivered; gateway must keep delivery unknown");
+    }
+}
+
+void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles,
+                                    std::string id, int64_t sent_at_ms, int64_t ttl_ms) {
+    // A retry reports the last observed state, never plays the same active/recent ID twice.
+    if (!id.empty() && id == notification_receipt_.id) {
+        SendNotificationStatus(notification_receipt_);
+        return;
+    }
+    if (const auto* receipt = notification_receipts_.Find(id)) {
+        SendNotificationStatus(*receipt);
+        return;
+    }
+    int64_t deadline_us = 0;
+    if (ttl_ms != 0) {
+        timeval now{};
+        gettimeofday(&now, nullptr);
+        const int64_t now_ms = static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_usec / 1000;
+        if (const char* reason =
+                ValidateNotifyWindow(now_ms, sent_at_ms, ttl_ms, has_server_time_)) {
+            SendNotificationStatus({id, "failed", reason});
+            return;
+        }
+        deadline_us = esp_timer_get_time() + (sent_at_ms + ttl_ms - now_ms) * 1000;
+    }
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
-        ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+        SendNotificationStatus({id, "busy", "not_idle"});
+        return;
+    }
+    if (audio_url.compare(0, 7, "http://") != 0 && audio_url.compare(0, 8, "https://") != 0) {
+        SendNotificationStatus({id, "failed", "invalid_audio_url"});
         return;
     }
 
@@ -1120,9 +1225,13 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
 
     if (!SetDeviceState(kDeviceStateNotifying)) {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        SendNotificationStatus({id, "busy", "state_transition"});
         return;
     }
 
+    notification_receipt_ = {std::move(id), "received", ""};
+    notification_deadline_us_ = deadline_us;
+    SendNotificationStatus(notification_receipt_);
     audio_service_.ResetDecoder();
     uint32_t playback_id = ++notification_playback_id_;
     if (playback_id == 0) {
@@ -1131,7 +1240,15 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
 
     bool started = notify_player_.Start(
-        std::move(audio_url), std::move(subtitles), playback_id,
+        std::move(audio_url), std::move(subtitles), playback_id, deadline_us,
+        [this](uint32_t id) {
+            Schedule([this, id]() {
+                if (GetDeviceState() == kDeviceStateNotifying && notification_playback_id_ == id) {
+                    notification_receipt_.state = "playing";
+                    SendNotificationStatus(notification_receipt_);
+                }
+            });
+        },
         [this](uint32_t id, const std::string& text) {
             Schedule([this, id, text]() {
                 if (GetDeviceState() == kDeviceStateNotifying && notification_playback_id_ == id) {
@@ -1145,12 +1262,20 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
 
     if (!started) {
         ESP_LOGE(TAG, "Failed to start notification playback");
-        StopNotification();
+        StopNotification("failed", "start_failed");
     }
 }
 
-void Application::StopNotification() {
+void Application::StopNotification(const char* state, const char* reason) {
     notify_player_.Stop();
+    if (!notification_receipt_.id.empty()) {
+        notification_receipt_.state = state;
+        notification_receipt_.reason = reason;
+        notification_receipts_.Save(notification_receipt_);
+        SendNotificationStatus(notification_receipt_);
+        notification_receipt_ = {};
+    }
+    notification_deadline_us_ = 0;
     audio_service_.ResetDecoder();
     auto& board = Board::GetInstance();
     board.GetDisplay()->SetChatMessage("assistant", "");
@@ -1166,7 +1291,11 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     }
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
-    StopNotification();
+    const bool expired =
+        notification_deadline_us_ != 0 && esp_timer_get_time() >= notification_deadline_us_;
+    StopNotification(success && !expired ? "completed" : "failed", expired   ? "expired"
+                                                                   : success ? ""
+                                                                             : "audio_failed");
 }
 
 void Application::Schedule(std::function<void()>&& callback) {

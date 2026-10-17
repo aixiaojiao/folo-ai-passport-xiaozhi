@@ -10,6 +10,9 @@ MQTT device, this is the existing MQTT control topic:
 ```json
 {
   "type": "notify",
+  "id": "task-20261018-001",
+  "sent_at_ms": 1792256400000,
+  "ttl_ms": 30000,
   "audio_url": "https://cdn.example.com/audio/task-complete.ogg",
   "subtitles": [
     {
@@ -28,7 +31,68 @@ MQTT device, this is the existing MQTT control topic:
 
 `subtitles` is optional. Each entry contains the media start time in milliseconds and the text to display. The device sorts entries by `start_ms` and updates the display only when playback crosses a new subtitle entry.
 
-The message has no acknowledgement, notification ID, state, kind, or expiry field. Delivery is best effort and only applies to online devices.
+The example timestamp is illustrative; send the **current Unix time in milliseconds**, not the
+example value. Delivery remains best effort and applies only to online devices.
+
+### Identity, expiry, and compatibility
+
+- `id` is optional for old senders. New senders should supply a unique ID containing 1–64 ASCII
+  letters, digits, `-`, `_`, `.`, or `:`. IDs correlate receipts; reuse an ID only for a retry of
+  the same logical notification. Invalid IDs are logged and rejected without a receipt.
+- `sent_at_ms` and `ttl_ms` must be supplied together, with an ID. Both are integer milliseconds;
+  TTL is 1–600,000 ms. Their sum is the absolute expiry, so transit time consumes the TTL.
+- Expiring requests require device time synchronized by the existing OTA server-time exchange.
+  An unsynchronized clock fails closed as `clock_unsynced`; a sender timestamp more than five
+  seconds in the future fails as `future_timestamp`. Expired requests fail as `expired`.
+- The accepted lifetime is converted to a monotonic deadline. The HTTP producer checks it and
+  each notification PCM frame is gated before codec output. Expiry cancels remaining playback;
+  a frame already handed to the codec cannot be retracted. This is not a hard real-time alarm.
+- An old request without these fields retains its previous best-effort behavior and produces no
+  correlatable receipt. An ID alone enables receipts but has **no expiry guarantee**.
+- There is **no notification delivery queue**: the device remains Idle-only. A distinct request
+  while busy returns `busy`, without changing or queueing behind the active notification.
+- The active ID and the last four terminal receipts are kept in RAM. Retrying one of these IDs
+  returns its current/terminal state without replay. The cache does not survive reboot and is
+  not permanent exactly-once delivery; the server must also deduplicate IDs and stop retries at
+  expiry. A busy rejection is not cached, so a retry can be admitted after the device is idle.
+- Metadata is bounded: URL ≤2,048 bytes, ≤32 subtitle entries, ≤4,096 combined subtitle text
+  bytes. The existing bounded audio buffers are unchanged.
+
+### Device receipts
+
+The device sends `notify_status` on the **existing control connection**, through shared
+`Protocol::SendNotifyStatus`. MQTT uses its existing publish topic; WebSocket uses its current
+connected socket. It does not open a UDP/audio channel or enable microphone upload to report a
+receipt. WebSocket currently connects only on demand: this feature does **not** create a new
+always-on WebSocket notification connection.
+
+```json
+{"type":"notify_status","id":"task-20261018-001","state":"received"}
+{"type":"notify_status","id":"task-20261018-001","state":"playing"}
+{"type":"notify_status","id":"task-20261018-001","state":"completed"}
+```
+
+| State | Actual evidence / meaning |
+| --- | --- |
+| `received` | Validated and admitted by the idle device; download/playback can still fail. |
+| `playing` | The first remote notification PCM frame has been handed to the codec. The built-in popup does not count. |
+| `completed` | HTTP/Ogg stream completed, at least one notification frame reached codec output, and all decode/playback queues and in-flight work drained without a reported decode failure or expiry. |
+| `busy` | Not admitted; `reason` is `not_idle` or `state_transition`. The current notification continues. |
+| `failed` | Rejected or stopped; reasons include `expired`, `clock_unsynced`, `future_timestamp`, invalid input, `start_failed`, `audio_failed`, `protocol_error`, and `network_disconnected`. |
+| `cancelled` | A wake/user/lifecycle interruption stopped it (`reason: interrupted`). It did not complete. |
+
+`completed` is firmware playback-pipeline evidence, **not proof that a human heard the message**.
+The existing codec API does not expose speaker audibility or a hardware playback acknowledgement.
+Decode errors cannot become `completed` merely because the queues drained. Receipts have no
+independent delivery guarantee: on a broken control connection they may be lost. A retry with the
+same ID can recover one of the four cached terminal states after reconnection; a missing receipt
+must remain `unknown`, never inferred as completion from a server publish result.
+
+The gateway/server must authenticate the device connection, correlate by **device identity + ID**,
+accept duplicate status events idempotently, keep terminal state from being downgraded by a late
+`received`/`playing`, and expire unresolved delivery as `unknown`. These gateway changes are
+**not included in this firmware repository**. In particular, xz-mqtt and OUYU must explicitly
+forward/store `notify_status` before an end-to-end success metric can be claimed.
 
 ## Audio response
 
@@ -49,7 +113,7 @@ The device accepts `notify` only while it is in `Idle`. It then performs the fol
 3. Clears previous playback and queues the built-in popup sound.
 4. Starts one HTTP GET in a background task.
 5. Incrementally demultiplexes Ogg packets and sends them directly to the existing Opus decode queue.
-6. Displays subtitles according to the media position of Opus packets reaching the audio output task.
+6. Displays subtitles according to the media position of Opus frames handed to codec output.
 7. Returns to `Idle` only after the HTTP stream has ended successfully and all queued audio has played.
 
 The popup is queued before the HTTP task starts, so remote audio cannot play before it. HTTP connection setup still overlaps the actual popup playback.
@@ -60,7 +124,8 @@ transition and normal end of playback are not reported as underruns.
 
 The device does not open the UDP audio channel, send `start-listening`, or automatically enter `Listening`. AFE-based devices may continue local wake-word detection during playback. Devices without playback echo cancellation retain the existing speaking-mode wake behavior; hardware wake controls can still cancel a notification.
 
-A wake action cancels the HTTP producer, clears queued notification audio, and continues through the normal wake flow. Network loss, HTTP errors, and invalid audio also cancel playback and return the device to `Idle`. A second notification received while the device is busy is ignored.
+A wake action cancels the HTTP producer, clears queued notification audio, and continues through the normal wake flow. Network loss, HTTP errors, and invalid audio also cancel playback and return the device to `Idle`. A distinct notification received while the device is busy is rejected as `busy` when it has an ID;
+legacy messages remain silently best effort.
 
 ## xz-mqtt forwarding
 
@@ -91,4 +156,32 @@ The RPC result contains the boolean returned by the MQTT send operation:
 }
 ```
 
-This result means that `xz-mqtt` wrote the publish message to the current online device connection. It does not confirm receipt or playback. `xz-mqtt` does not create a UDP session, start the chat bridge, proxy the Ogg file, or retain notifications for offline devices.
+This result means only **gateway accepted/published**, not `received`, `playing`, or `completed`.
+It means that `xz-mqtt` wrote the publish message to the current online device connection.
+Any controller/UI must label it as accepted, not played or successfully delivered. The sender must
+forward `id`, `sent_at_ms`, and `ttl_ms` unchanged in `params`, and consume device receipts separately.
+It does not confirm receipt or playback. `xz-mqtt` does not create a UDP session, start the chat bridge, proxy the Ogg file, or retain notifications for offline devices.
+
+
+## Validation and release gate
+
+Host regression coverage compiles the production notification player with hardware/network
+fakes and exercises successful playback, no-output drain, decode failure, HTTP/Ogg failure,
+expiry before download and during queued playback, stale callbacks, cancellation, task failure,
+ID validation, the TTL window, bounded duplicate receipt retention, and shared Protocol receipt
+serialization using host cJSON (when available). It also checks that receipt transmission failure
+is returned and does not open an audio channel:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p test_notify_delivery.py -v
+```
+
+Before shipping firmware, build with ESP-IDF 6.0.1+ (prefer 6.1), then verify on the AI Passport
+ESP32-C3 and a representative AFE-enabled board. Exercise MQTT and an already-connected
+WebSocket independently: idle success, busy, duplicate active/terminal ID, expired before arrival,
+expiry while HTTP is stalled, malformed Ogg/decoder failure, wake cancellation, disconnect,
+reconnect + duplicate-status recovery, and ordinary conversation/wake/microphone behavior.
+Check logs plus correlated device receipts and actual speaker playback. A successful host test
+is not a firmware build, transport integration, physical test, or verification that the gateway
+stores the receipt. No gateway integration, firmware flash, or physical acceptance has been
+performed by the P0 source change.

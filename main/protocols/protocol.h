@@ -3,7 +3,9 @@
 
 #include <cJSON.h>
 #include <chrono>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -66,6 +68,8 @@ public:
     virtual void SendStopListening();
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual void SendMcpMessage(const std::string& message);
+    // Control connection only; never opens an audio channel.
+    bool SendNotifyStatus(const std::string& id, const char* state, const char* reason = "");
 
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;
