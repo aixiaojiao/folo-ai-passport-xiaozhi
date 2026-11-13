@@ -218,6 +218,12 @@ bool WebsocketProtocol::Connect(bool report_error) {
         }
         last_received_seconds_ = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
         if (binary) {
+            const auto received_us = esp_timer_get_time();
+            if (last_audio_received_us_ != 0 && received_us - last_audio_received_us_ > 120000) {
+                ESP_LOGW(TAG, "Audio receive gap: elapsed_ms=%lld",
+                         static_cast<long long>((received_us - last_audio_received_us_) / 1000));
+            }
+            last_audio_received_us_ = received_us;
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
                     if (len < sizeof(BinaryProtocol2)) {
@@ -265,6 +271,11 @@ bool WebsocketProtocol::Connect(bool report_error) {
             // Parse JSON data
             auto root = cJSON_ParseWithLength(data, len);
             auto type = cJSON_GetObjectItem(root, "type");
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (cJSON_IsString(type) && strcmp(type->valuestring, "tts") == 0 &&
+                cJSON_IsString(state) && strcmp(state->valuestring, "start") == 0) {
+                last_audio_received_us_ = 0;
+            }
             if (cJSON_IsString(type)) {
                 if (strcmp(type->valuestring, "hello") == 0) {
                     ParseServerHello(root);
