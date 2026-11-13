@@ -29,3 +29,18 @@ the connected C3 identity, the current app and a fresh protected-header backup
 before flashing; preserve NVS, bootloader, partition table, OTA metadata, OTA0
 and the unchanged native wake assets. Previous 2.4.2-footmate.1 application is
 the app-only rollback target. Never flash the attached S3 microphone.
+
+## Follow-up diagnosis before implementation
+The first footmate.2 physical trial still dropped34/129 packets; output gaps
+were360ms,5129ms,6710ms. A second turn stalled before TTS stop. Cloud receipts
+showed129 and158 frames sent. The Mac public-path probe also saw1.67s packet
+gaps; encrypted origin forwarding saw0.81s gaps, so neither comparison proves
+the C3 scheduler is innocent or the public edge is the sole cause.
+Distinguish: (1) delayed WebSocket arrival, (2) main-loop callback starvation,
+(3) decode/output starvation. Add timestamp-only RX and schedule-gap warnings
+before tuning buffers or changing transport. Do not log payloads or tokens.
+Failure risks: inter-turn false positives, callback thread races and logging
+per frame causing its own starvation. Only gaps over120ms are reported; reset
+RX timing on a new TTS start. Application state stays scheduled on main.
+
+Follow-up validation:8 existing host checks and canonical C3 build passed. App2470496 bytes; SHA256 ca96f9456199a9d7f1a86f642928addadb48a9e85dd5c31308e57a90c6ea82b3. Physical diagnosis pending.

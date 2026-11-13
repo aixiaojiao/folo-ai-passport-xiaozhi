@@ -592,7 +592,13 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         // std::function needs a copyable capture; moving the payload avoids copying Opus data.
         auto shared_packet = std::shared_ptr<AudioStreamPacket>(std::move(packet));
-        ScheduleProtocol([this, packet = std::move(shared_packet)]() {
+        const auto received_us = esp_timer_get_time();
+        ScheduleProtocol([this, packet = std::move(shared_packet), received_us]() {
+            const auto schedule_us = esp_timer_get_time() - received_us;
+            if (schedule_us > 120000) {
+                ESP_LOGW(TAG, "Audio schedule delay: elapsed_ms=%lld",
+                         static_cast<long long>(schedule_us / 1000));
+            }
             if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
                 if (audio_service_.PushPacketToDecodeQueue(
                         std::make_unique<AudioStreamPacket>(std::move(*packet)))) {

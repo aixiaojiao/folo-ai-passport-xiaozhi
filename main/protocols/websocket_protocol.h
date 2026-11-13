@@ -28,6 +28,7 @@ private:
     EventGroupHandle_t event_group_handle_;
     std::unique_ptr<WebSocket> websocket_;
     int version_ = 1;
+    int64_t last_audio_received_us_ = 0;
     esp_timer_handle_t reconnect_timer_ = nullptr;
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     std::shared_ptr<std::atomic<bool>> channel_alive_;
