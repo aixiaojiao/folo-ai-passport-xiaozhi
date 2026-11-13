@@ -21,7 +21,7 @@ recovery data. Physical acceptance must require zero dropped packets and inspect
 gap warnings alongside the independent S3 microphone capture.
 
 Validation: existing eight host checks passed; canonical C3 zh-CN nihaoxiaozhi
-build passed with IDF5.5.2. App size2478144 bytes, fits the original OTA partition.
+build passed with IDF5.5.2. App size2469952 bytes, fits the original OTA partition.
 Hardware acceptance is separate and pending at PR creation.
 
 Install only the reviewed application at existing OTA1 offset0x310000. Verify
