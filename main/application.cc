@@ -708,6 +708,9 @@ void Application::InitializeProtocol() {
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 ScheduleProtocol([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
+                        ESP_LOGI(TAG, "TTS packets: queued=%lu dropped=%lu",
+                                 static_cast<unsigned long>(tts_packet_count_),
+                                 static_cast<unsigned long>(tts_dropped_packets_));
                         if (passive_tts_) {
                             ESP_LOGI(
                                 TAG,
