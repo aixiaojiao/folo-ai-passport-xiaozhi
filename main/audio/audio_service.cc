@@ -312,11 +312,13 @@ void AudioService::AudioInputTask() {
 }
 
 void AudioService::AudioOutputTask() {
+    uint32_t previous_generation = 0;
+    bool previous_output = false;
+    std::chrono::steady_clock::time_point previous_completed;
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-        audio_queue_cv_.wait(lock, [this]() {
-            return !audio_playback_queue_.empty() || service_stopped_.load();
-        });
+        audio_queue_cv_.wait(
+            lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_.load(); });
         if (service_stopped_.load()) {
             break;
         }
@@ -324,6 +326,7 @@ void AudioService::AudioOutputTask() {
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
         output_in_flight_ = true;
+        const uint32_t generation = playback_generation_;
         audio_queue_cv_.notify_all();
         lock.unlock();
 
@@ -341,6 +344,18 @@ void AudioService::AudioOutputTask() {
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
+        if (previous_output && previous_generation == generation) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     last_output_time_ - previous_completed)
+                                     .count();
+            if (elapsed > 2 * OPUS_FRAME_DURATION_MS) {
+                ESP_LOGW(TAG, "Playback output gap: generation=%lu elapsed_ms=%ld",
+                         static_cast<unsigned long>(generation), static_cast<long>(elapsed));
+            }
+        }
+        previous_completed = last_output_time_;
+        previous_generation = generation;
+        previous_output = true;
         debug_statistics_.playback_count++;
 
         bool notify_drained = false;
@@ -586,12 +601,25 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
     const uint32_t generation = playback_generation_;
-    if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+    const size_t incoming_bytes = packet->payload.size();
+    if (incoming_bytes > MAX_DECODE_BYTES_IN_QUEUE) {
+        return false;
+    }
+    const auto has_capacity = [this, incoming_bytes]() {
+        if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+            return false;
+        }
+        size_t bytes = incoming_bytes;
+        for (const auto& queued : audio_decode_queue_) {
+            bytes += queued->payload.size();
+        }
+        return bytes <= MAX_DECODE_BYTES_IN_QUEUE;
+    };
+    if (!has_capacity()) {
         if (wait) {
-            audio_queue_cv_.wait(lock, [this, generation]() {
-                return service_stopped_.load() ||
-                       generation != playback_generation_ ||
-                       audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
+            audio_queue_cv_.wait(lock, [this, generation, &has_capacity]() {
+                return service_stopped_.load() || generation != playback_generation_ ||
+                       has_capacity();
             });
         } else {
             return false;
