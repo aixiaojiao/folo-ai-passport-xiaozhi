@@ -1188,17 +1188,27 @@ void Application::StartListeningAudio() {
     }
 
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
-    // Send the start listening command
-    protocol_->SendStartListening(listening_mode_);
-    audio_service_.EnableVoiceProcessing(true);
-
-    ConfigureWakeWordForListening();
-
-    // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
     if (play_popup_on_listening_) {
         play_popup_on_listening_ = false;
+        // C3 has no AEC: its own cue must finish before microphone upload.
+        // Reuse the existing drain event so stop/state changes remain responsive.
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(false);
+        audio_service_.ResetDecoder();
+        pending_listening_start_ = true;
         audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+        if (!audio_service_.IsPlaybackIdle()) {
+            ESP_LOGI(TAG, "Waiting for listening cue playback");
+            return;
+        }
+        // Empty/failed/already-drained cue: do not wait for a missing event.
+        pending_listening_start_ = false;
     }
+
+    ESP_LOGI(TAG, "Starting microphone after playback");
+    protocol_->SendStartListening(listening_mode_);
+    audio_service_.EnableVoiceProcessing(true);
+    ConfigureWakeWordForListening();
 }
 
 void Application::ConfigureWakeWordForListening() {
